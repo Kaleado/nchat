@@ -10,7 +10,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 
 const HOME = os.homedir();
 const NICKS_DIR = path.join(HOME, ".nchat", "nicks");
@@ -98,6 +98,40 @@ fs.writeFileSync(offFile, String(finalOff));
 return events;
 }
 
+// This session's `nchat listen`: found by its command line (the session's
+// nick file, which it follows), else by the pid file. If there is none (it
+// crashed, or the pid file is stale), a new one is started: without it
+// nothing reaches the spool and the session goes deaf. It replays what the
+// hub has that wasn't acked, so nothing is lost meanwhile.
+const nickFile = path.join(NICKS_DIR, `cc-${sid}`);
+const pidFile = path.join(spoolDir, `${sid}.pid`);
+function listenerPid() {
+  try {
+    for (const entry of fs.readdirSync("/proc")) {
+      if (!/^\d+$/.test(entry)) continue;
+      try {
+        const argv = fs.readFileSync(`/proc/${entry}/cmdline`, "utf8").split("\0");
+        if (argv.includes("listen") && argv.includes(nickFile)) return Number(entry);
+      } catch {}
+    }
+  } catch {}
+  try { const pid = Number(fs.readFileSync(pidFile, "utf8")); process.kill(pid, 0); return pid; } catch { return null; }
+}
+function ensureListener() {
+  let pid = listenerPid();
+  if (!pid && NICK) {
+    try {
+      const child = spawn(NCHAT_BIN, ["listen", "--as", NICK, "--follow", nickFile], {
+        detached: true, stdio: ["ignore", fs.openSync(spoolFile, "a"), "ignore"],
+      });
+      child.unref();
+      pid = child.pid;
+    } catch {}
+  }
+  if (pid) { try { if (Number(fs.readFileSync(pidFile, "utf8")) !== pid) throw 0; } catch { fs.writeFileSync(pidFile, String(pid)); } }
+  return pid;
+}
+
 function pending() {
   let size = 0, off = 0;
   try { size = fs.statSync(spoolFile).size; } catch {}
@@ -112,10 +146,9 @@ if (eventName === "Wait") {
   try { const old = Number(fs.readFileSync(waitFile, "utf8")); if (old && old !== process.pid) process.kill(old); } catch {}
   fs.writeFileSync(waitFile, String(process.pid));
   const mine = () => { try { return Number(fs.readFileSync(waitFile, "utf8")) === process.pid; } catch { return false; } };
-  // nothing more can arrive once this session's `nchat listen` is gone
-  const listening = () => {
-    try { process.kill(Number(fs.readFileSync(path.join(spoolDir, `${sid}.pid`), "utf8")), 0); return true; } catch { return false; }
-  };
+  // keep this session's listener running (session-end stops us through
+  // the wait file); without a nick there's nothing to listen as
+  const listening = () => !!ensureListener();
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   await sleep(2 * BATCH_MS); // let the synchronous Stop drain take what's already there
   for (;;) {
@@ -133,6 +166,7 @@ if (eventName === "Wait") {
   }
 }
 
+ensureListener();
 const events = drain();
 if (events.length) {
   const batch = events.slice(-MAX_LINES).join("\n");

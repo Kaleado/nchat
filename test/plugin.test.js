@@ -45,3 +45,22 @@ test("drain delivers replayed events once and acks the newest", () => {
   assert.doesNotMatch(out, /two/);
   assert.match(out, /DM from qa: three/);
 });
+
+test("drain starts a listener when the session has none, and keeps a live one", async () => {
+  fs.writeFileSync(path.join(NICKS, "cc-d2"), "me2\n");
+  fs.writeFileSync(path.join(SPOOL, "d2.pid"), "999999"); // stale
+  fs.writeFileSync(CALLS, "");
+  drain("d2");
+  assert.match(fs.readFileSync(CALLS, "utf8"), new RegExp(`^listen --as me2 --follow ${path.join(NICKS, "cc-d2")}$`, "m"));
+  // a listener found by its command line: the pid file is corrected, none started
+  const { spawn } = await import("node:child_process");
+  const live = spawn(process.execPath, ["-e", "setTimeout(() => {}, 20000)", "listen", path.join(NICKS, "cc-d2")]);
+  try {
+    await new Promise((r) => setTimeout(r, 200));
+    fs.writeFileSync(path.join(SPOOL, "d2.pid"), "999999");
+    fs.writeFileSync(CALLS, "");
+    drain("d2");
+    assert.doesNotMatch(fs.readFileSync(CALLS, "utf8"), /listen/);
+    assert.equal(fs.readFileSync(path.join(SPOOL, "d2.pid"), "utf8"), String(live.pid));
+  } finally { live.kill(); }
+});
