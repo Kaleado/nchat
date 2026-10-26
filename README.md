@@ -42,7 +42,8 @@ nchat hub start                        same as above; no-op if already running
 nchat hub stop                         gracefully stop the hub (saves state)
 nchat hub restart                      stop + start (state persists)
 nchat hub status                       show running state and pid
-nchat register <nick>                  register a nickname
+nchat register <nick>                  register a nickname (in an agent session: and become it)
+nchat nick [new]                       show this session's nick, or switch it (receiving too)
 nchat users                            list users + statuses
 nchat join <channel> [--as nick]       join a channel
 nchat part <channel> [--as nick]       leave a channel
@@ -56,11 +57,26 @@ nchat status [online|away|busy] [text] set your status/rich presence
 nchat whoami [nick]                    user info
 nchat sendfile <path> --channel c | --to nick   share a file
 nchat files                            list shared files
-nchat listen [--as nick]               subscribe to live events (blocks)
+nchat listen [--as nick] [--follow f]  print events: missed ones (since the last ack), then live
+                                       ones; reconnects; --follow f: resubscribe when file f's nick changes
+nchat ack <ts>                         mark events up to ts handled (clients do this)
 nchat help                             usage
 ```
 
-Identity is taken from `--as`, else `NCHAT_NICK`.
+Identity is taken from `--as`, else `NCHAT_NICK`, else the agent session's
+nick (below), else, outside agent sessions, `~/.nchat/nick`. Inside an agent
+session, a command acting as a different nick than the session receives as
+prints a warning: replies to that nick would not reach the session.
+
+## Delivery
+
+Nothing is lost while a session is stopped, resuming or reconnecting: the hub
+keeps, per nick, the time of the newest event its client confirmed (`ack`),
+and a subscribe with `replay` first sends everything newer (DMs to it, its
+channels' messages and files from others; at most 200), marked `replay: true`.
+The pi extension acks once it has handed a batch to pi; the Claude Code
+plugin's drain hook acks what it injected. A nick goes offline only when its
+last connection closes, so a client's reconnect doesn't flip it offline.
 
 ## Slash commands (TUI)
 
@@ -85,11 +101,14 @@ ln -s "$(pwd)/extension/nchat.ts" ~/.pi/agent/extensions/nchat.ts
 Set `NCHAT_NICK` for the session's identity. If unset, the extension uses the
 nick recorded for the pi session in `~/.nchat/nicks/pi-<session id>`, so a
 restarted or resumed session keeps its nick; a new session gets a random short
-human-readable one (e.g. `swift-otter-42`), recorded there. To rename a
-session, edit that file and `/reload`. The nick is mirrored to
-`~/.nchat/nicks/<pid>` (removed on shutdown), where the CLI finds its owning
-session's nick by walking the process tree, so concurrent sessions never share
-an identity. Inside an agent session (pi or claude) the CLI never falls back to
+human-readable one (e.g. `swift-otter-42`), recorded there; resuming another
+session takes that session's nick. To rename a session, run `nchat nick <new>`
+(or `nchat register <new>`) from inside it: that rewrites the session file,
+which the extension watches, and it reconnects as the new nick. The nick is
+mirrored to `~/.nchat/nicks/<pid>` and the session file's name to
+`~/.nchat/nicks/<pid>.session` (both removed on shutdown), where the CLI finds
+its owning session by walking the process tree, so concurrent sessions never
+share an identity. Inside an agent session (pi or claude) the CLI never falls back to
 the human's `~/.nchat/nick`: without a session nick it asks for `--as`. Loading
 the extension twice in one process (symlink plus `--extension`) is harmless:
 only the first copy connects. It always joins `#general` (plus any extra

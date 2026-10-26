@@ -58,12 +58,16 @@ function claudePid() {
   return null;
 }
 const ownerPid = claudePid();
-if (ownerPid) fs.writeFileSync(path.join(nickDir, String(ownerPid)), nick + "\n");
-// Per-session env so `nchat send` (without --as) uses this session's nick.
-// Claude Code sources $CLAUDE_ENV_FILE before each Bash command; the
-// per-session file is there to source by hand. (One shared ~/.nchat/cc-env
-// let concurrent sessions overwrite each other's nick.)
-const envLine = `export NCHAT_NICK=${nick}\n`;
+if (ownerPid) {
+  fs.writeFileSync(path.join(nickDir, String(ownerPid)), nick + "\n");
+  fs.writeFileSync(path.join(nickDir, `${ownerPid}.session`), `cc-${sid}\n`);
+}
+// Per-session env so `nchat send` (without --as) uses this session's nick:
+// NCHAT_SESSION names the session file, which the CLI reads each time, so
+// `nchat nick <new>` takes effect (a fixed NCHAT_NICK would pin the old
+// one). Claude Code sources $CLAUDE_ENV_FILE before each Bash command; the
+// per-session file is there to source by hand.
+const envLine = `export NCHAT_SESSION=cc-${sid}\n`;
 const envFile = path.join(NCHAT_DIR, `cc-env-${sid}`);
 fs.writeFileSync(envFile, envLine);
 if (process.env.CLAUDE_ENV_FILE) {
@@ -72,15 +76,17 @@ if (process.env.CLAUDE_ENV_FILE) {
 fs.mkdirSync(spoolDir, { recursive: true });
 
 await waitForHub();
-sh(["register", nick]);
+sh(["register", nick, "--as", nick]);
 sh(["join", "general", "--as", nick]);
 sh(["status", "online", "claude session", "--as", nick]);
 
-// start the event listener spooling to the session file
+// start the event listener spooling to the session file: it replays what
+// came since the drain last acked (so nothing is lost while the session was
+// stopped), follows the nick file, and reconnects if the hub restarts
 try { fs.unlinkSync(spoolFile); } catch {}
 const pidFile = path.join(spoolDir, `${sid}.pid`);
 try { process.kill(Number(fs.readFileSync(pidFile, "utf8"))); } catch {} // resume/clear: replace the old listener
-const child = spawn(NCHAT_BIN, ["listen", "--as", nick], { detached: true, stdio: ["ignore", fs.openSync(spoolFile, "a"), "ignore"] });
+const child = spawn(NCHAT_BIN, ["listen", "--as", nick, "--follow", nickFile], { detached: true, stdio: ["ignore", fs.openSync(spoolFile, "a"), "ignore"] });
 child.unref();
 fs.writeFileSync(pidFile, String(child.pid)); // session-end stops it
 fs.writeFileSync(path.join(spoolDir, `${sid}.off`), "0");
@@ -90,9 +96,9 @@ const channels = ["general", ...extra.filter((c) => c !== "general")];
 for (const ch of extra) sh(["join", ch, "--as", nick]);
 
 const context = [
-  `nchat is active. Your nick is ${nick} (identity: pass --as ${nick} to nchat, or \`source ${envFile}\`).`,
+  `nchat is active. Your nick is ${nick}; nchat commands use it automatically (or \`source ${envFile}\`). To change it, run \`nchat nick <new>\`: messages then reach you under the new nick. Don't use --as with another nick, or replies won't reach you.`,
   `You are in: ${channels.map((c) => "#" + c).join(" ")}. Incoming messages, DMs, reactions, and file offers will be delivered to you automatically — respond to nchat messages in nchat, not inline.`,
-  `Send with: nchat send <channel> <text> --as ${nick} · DM: nchat msg <nick> <text> --as ${nick}.`,
+  `Send with: nchat send <channel> <text> · DM: nchat msg <nick> <text>.`,
 ].join("\n");
 
 process.stdout.write(JSON.stringify({

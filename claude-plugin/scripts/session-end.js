@@ -23,6 +23,6 @@ for (const p of [`${spool}.pid`, `${spool}.wait`]) {
   try { process.kill(Number(fs.readFileSync(p, "utf8"))); } catch {}
 }
 // (the nick file stays, so a resumed session keeps its nick)
-for (const f of [path.join(HOME, ".nchat", `cc-env-${sid}`), `${spool}.pid`, `${spool}.wait`, `${spool}.log`, `${spool}.off`]) {
+for (const f of [path.join(HOME, ".nchat", `cc-env-${sid}`), `${spool}.pid`, `${spool}.wait`, `${spool}.log`, `${spool}.off`, `${spool}.acked`]) {
   try { fs.unlinkSync(f); } catch {}
 }

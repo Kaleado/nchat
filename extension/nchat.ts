@@ -15,19 +15,30 @@ const randomNick = () => `${pick(ADJECTIVES)}-${pick(NOUNS)}-${Math.floor(Math.r
 const NICKS_DIR = path.join(path.dirname(SOCKET_PATH), "nicks");
 // Identity: $NCHAT_NICK, else the nick recorded for this pi *session*
 // (nicks/pi-<session id>, kept across restarts and reloads, so a resumed
-// session keeps its nick), else a random one, recorded there. The pid file
-// nicks/<pid> mirrors it for the CLI, which finds its pi session's nick by
-// walking up the process tree; it goes when the process does.
+// session keeps its nick), else a random one, recorded there. Each session
+// has its own: resuming another session takes that one's nick, not the
+// process's previous one. The session file is watched: `nchat nick <new>`
+// run inside the session rewrites it, and the extension reconnects as the
+// new nick. The pid file nicks/<pid> mirrors the nick for the CLI, which
+// finds its pi session by walking up the process tree, and
+// nicks/<pid>.session names the session file; both go with the process.
 const PID_FILE = path.join(NICKS_DIR, String(process.pid));
 const read = (f: string) => { try { return fs.readFileSync(f, "utf8").trim() || null; } catch { return null; } };
+const validNick = (n: string | null) => !!n && /^[a-zA-Z0-9_-]{1,32}$/.test(n);
+let sessionFile: string | null = null;
+function writeIfChanged(f: string, text: string) {
+  if (read(f) !== text) fs.writeFileSync(f, text + "\n");
+}
 function resolveNick(sessionId: string | null): string {
   if (process.env.NCHAT_NICK) return process.env.NCHAT_NICK;
-  const sessionFile = sessionId ? path.join(NICKS_DIR, `pi-${sessionId}`) : null;
-  const nick = (sessionFile && read(sessionFile)) || read(PID_FILE) || randomNick();
+  sessionFile = sessionId ? path.join(NICKS_DIR, `pi-${sessionId}`) : null;
+  const recorded = sessionFile && read(sessionFile);
+  const nick = validNick(recorded) ? recorded! : randomNick();
   try {
     fs.mkdirSync(NICKS_DIR, { recursive: true });
-    if (sessionFile && read(sessionFile) !== nick) fs.writeFileSync(sessionFile, nick + "\n");
-    if (read(PID_FILE) !== nick) fs.writeFileSync(PID_FILE, nick + "\n");
+    if (sessionFile) writeIfChanged(sessionFile, nick);
+    writeIfChanged(PID_FILE, nick);
+    if (sessionFile) writeIfChanged(PID_FILE + ".session", path.basename(sessionFile));
   } catch {}
   return nick;
 }
@@ -36,7 +47,7 @@ let NICK = process.env.NCHAT_NICK || read(PID_FILE) || "";
 // Clean up pid nick files from dead processes (pi-<session> files stay).
 try {
   for (const f of fs.readdirSync(NICKS_DIR)) {
-    if (!/^\d+$/.test(f)) continue;
+    if (!/^\d+(\.session)?$/.test(f)) continue;
     const pid = parseInt(f, 10);
     if (pid !== process.pid) {
       try { process.kill(pid, 0); } catch {
@@ -70,6 +81,7 @@ export default function nchatExtension(pi: ExtensionAPI) {
   const seenIds = new Set<string>(); // dedupe event ids across sockets/retries
 
   let pending: string[] = [];       // messages batched for the model
+  let pendingTs = 0;                // the newest event among them (acked once handed to pi)
   let flushTimer: ReturnType<typeof setTimeout> | null = null;
   let busy = false;                 // a run is in progress
 
@@ -115,7 +127,7 @@ export default function nchatExtension(pi: ExtensionAPI) {
     } catch {}
   }
 
-  function queue(text: string, dedupeId?: string) {
+  function queue(text: string, dedupeId?: string, ts?: number) {
     if (dedupeId) {
       if (seenIds.has(dedupeId)) return;
       seenIds.add(dedupeId);
@@ -129,13 +141,22 @@ export default function nchatExtension(pi: ExtensionAPI) {
       }
     }
     pending.push(text);
+    if (ts && ts > pendingTs) pendingTs = ts;
     if (flushTimer) return;
     flushTimer = setTimeout(flush, BATCH_MS);
+  }
+
+  // tell the hub these are handled: a later (re)subscribe replays only newer
+  function ack(ts: number) {
+    if (!ts || !sock || !sock.writable) return;
+    try { sock.write(JSON.stringify({ id: "ack", method: "ack", params: { nick: NICK, ts } }) + "\n"); } catch {}
   }
 
   function flush() {
     flushTimer = null;
     const lines = pending.splice(0, pending.length);
+    const ts = pendingTs;
+    pendingTs = 0;
     if (!lines.length) return;
     notifyHuman(`nchat: ${lines.length} new message(s)`);
     if (TRIGGER_TURNS) {
@@ -151,6 +172,7 @@ export default function nchatExtension(pi: ExtensionAPI) {
         { triggerTurn: false },
       );
     }
+    ack(ts);
   }
 
   function disconnectCurrent() {
@@ -171,9 +193,10 @@ export default function nchatExtension(pi: ExtensionAPI) {
     sock = mySock;
     mySock.on("connect", () => {
       if (gen !== generation || closed) return;
-      mySock.write(JSON.stringify({ id: "sub", method: "subscribe", params: { nick: NICK } }) + "\n");
+      // register before subscribing, so a new nick gets its replay cursor
       mySock.write(JSON.stringify({ id: "reg", method: "register", params: { nick: NICK, hostname: os.hostname() } }) + "\n");
-      mySock.write(JSON.stringify({ id: "st", method: "status", params: { nick: NICK, status: "online", statusText: "pi session" } }) + "\n");
+      mySock.write(JSON.stringify({ id: "sub", method: "subscribe", params: { nick: NICK, replay: true } }) + "\n");
+      mySock.write(JSON.stringify({ id: "st", method: "status", params: { nick: NICK, status: "online", statusText: "pi session", ifOffline: true } }) + "\n");
       for (const ch of CHANNELS) {
         mySock.write(JSON.stringify({ id: `join:${ch}`, method: "join", params: { nick: NICK, channel: ch } }) + "\n");
       }
@@ -194,7 +217,9 @@ export default function nchatExtension(pi: ExtensionAPI) {
           continue;
         }
         const text = fmtEvent(msg);
-        if (text) queue(text, msg.message?.id ?? msg.file?.id);
+        const ts = msg.message?.ts ?? msg.file?.ts;
+        if (text) queue(text, msg.message?.id ?? msg.file?.id, ts);
+        else if (ts && !flushTimer && !pending.length) ack(ts); // own echo etc.: nothing to hand over
       }
     });
     mySock.on("error", () => scheduleReconnect());
@@ -207,6 +232,24 @@ export default function nchatExtension(pi: ExtensionAPI) {
   function scheduleReconnect() {
     if (closed || reconnectTimer) return;
     reconnectTimer = setTimeout(() => { reconnectTimer = null; connect(); }, 3000);
+  }
+
+  // `nchat nick <new>` rewrites the session file: become the new nick
+  function switchNick(next: string) {
+    if (!validNick(next) || next === NICK) return;
+    if (sock && NICK) {
+      try { sock.write(JSON.stringify({ id: "off", method: "status", params: { nick: NICK, status: "offline" } }) + "\n"); } catch {}
+    }
+    NICK = next;
+    try { writeIfChanged(PID_FILE, NICK); } catch {}
+    connect();
+  }
+  let watched: string | null = null;
+  function watchSessionFile() {
+    if (watched === sessionFile) return;
+    if (watched) fs.unwatchFile(watched);
+    watched = sessionFile;
+    if (watched) fs.watchFile(watched, { interval: 1000 }, () => { const n = watched && read(watched); if (n) switchNick(n); });
   }
 
   pi.on("session_start", async (_event, ctx) => {
@@ -225,6 +268,7 @@ export default function nchatExtension(pi: ExtensionAPI) {
       NICK = nick;
       connect();
     }
+    watchSessionFile();
     updateWidget(`(${CHANNELS.map((c) => "#" + c).join(" ")})`);
   });
 
@@ -243,6 +287,8 @@ export default function nchatExtension(pi: ExtensionAPI) {
     g.__nchatExtensionLoaded = false; // a reload loads it afresh
     if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
     try { fs.unlinkSync(PID_FILE); } catch {}
+    try { fs.unlinkSync(PID_FILE + ".session"); } catch {}
+    if (watched) { fs.unwatchFile(watched); watched = null; }
     // send offline status before teardown
     if (sock) {
       try {

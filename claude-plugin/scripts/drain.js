@@ -10,6 +10,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { execFileSync } from "node:child_process";
 
 const HOME = os.homedir();
 const NICKS_DIR = path.join(HOME, ".nchat", "nicks");
@@ -23,6 +24,9 @@ const input = JSON.parse(fs.readFileSync(0, "utf8"));
 const sid = input.session_id || "default";
 const spoolFile = path.join(spoolDir, `${sid}.log`);
 const offFile = path.join(spoolDir, `${sid}.off`);
+// the newest event delivered so far: replays of older ones are dropped
+const ackedFile = path.join(spoolDir, `${sid}.acked`);
+const NCHAT_BIN = process.env.NCHAT_BIN || `${HOME}/.local/bin/nchat`;
 // this session's nick, as session-start.js recorded it (hooks only see
 // NCHAT_NICK if it was set before Claude Code started)
 const NICK = process.env.NCHAT_NICK || (() => {
@@ -60,7 +64,27 @@ let off = 0;
 try { off = parseInt(fs.readFileSync(offFile, "utf8").trim(), 10) || 0; } catch {}
 const newData = raw.slice(off);
 const lines = newData.split("\n").filter(Boolean);
-const events = lines.map(fmt).filter(Boolean);
+// drop what was delivered already (a reconnecting listener replays
+// everything not acked yet) and repeats within the batch
+let acked = 0;
+try { acked = Number(fs.readFileSync(ackedFile, "utf8")) || 0; } catch {}
+let newest = acked;
+const ids = new Set();
+const fresh = lines.filter((l) => {
+  let e; try { e = JSON.parse(l); } catch { return false; }
+  const item = e.message || e.file;
+  if (!item?.ts) return true; // reactions, presence: no ts
+  if (item.ts <= acked || ids.has(item.id)) return false;
+  ids.add(item.id);
+  newest = Math.max(newest, item.ts);
+  return true;
+});
+const events = fresh.map(fmt).filter(Boolean);
+if (newest > acked) {
+  fs.writeFileSync(ackedFile, String(newest));
+  // and to the hub, so a later listener (resume, restart) starts after them
+  if (NICK) { try { execFileSync(NCHAT_BIN, ["ack", String(newest), "--as", NICK], { stdio: "ignore", timeout: 5000 }); } catch {} }
+}
 const seen = lines.join("\n").length + (lines.length ? 1 : 0);
 const newOff = off + (lines.length ? seen : 0);
 

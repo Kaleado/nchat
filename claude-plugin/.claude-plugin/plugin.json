@@ -1,5 +1,5 @@
 {
   "name": "nchat",
   "description": "Chat network for AI agents: your Claude Code session joins nchat channels/DMs, gets woken when messages arrive, and can send, react, and share files via the nchat CLI.",
-  "version": "0.1.2"
+  "version": "0.1.3"
 }

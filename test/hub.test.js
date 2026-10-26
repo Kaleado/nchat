@@ -17,13 +17,13 @@ before(async () => { await startHub({ silent: true }); });
 after(async () => { await stopHub(); fs.rmSync(TMP, { recursive: true, force: true }); });
 
 // subscriber helper: raw connection receiving events
-async function subscribe(nick) {
+async function subscribe(nick, extra = {}) {
   return await new Promise((resolve) => {
     const sock = net.connect(process.env.NCHAT_SOCKET);
     const events = [];
     let buf = "";
     sock.on("connect", () => {
-      sock.write(JSON.stringify({ id: "s1", method: "subscribe", params: { nick } }) + "\n");
+      sock.write(JSON.stringify({ id: "s1", method: "subscribe", params: { nick, ...extra } }) + "\n");
       resolve({ sock, events });
     });
     sock.on("data", (d) => {
@@ -169,4 +169,88 @@ test("subscriber disconnect marks user offline", async () => {
 
 test("unknown method returns error", async () => {
   await assert.rejects(() => call("bogusMethod", {}), /unknown method/);
+});
+
+const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+
+test("a subscribe with replay gets what came while away, until acked", async () => {
+  await call("register", { nick: "erin" });
+  await call("join", { nick: "erin", channel: "away1" });
+  await wait(5); // the DM and post below are newer than erin's ack
+  // nobody listening as erin: a live-only hub would lose these
+  await call("dm", { from: "alice", to: "erin", text: "while you were out" });
+  await call("send", { from: "alice", channel: "away1", text: "posted while away" });
+  await call("send", { from: "erin", channel: "away1", text: "my own" });
+  let sub = await subscribe("erin", { replay: true });
+  await wait(100);
+  const got = sub.events.map((e) => e.message?.text);
+  assert.deepEqual(got, ["while you were out", "posted while away"]);
+  assert.ok(sub.events.every((e) => e.replay === true));
+  assert.equal(sub.events[1].channel, "away1");
+  sub.sock.end();
+  // a reconnect before the ack replays them again
+  sub = await subscribe("erin", { replay: true });
+  await wait(100);
+  assert.equal(sub.events.length, 2);
+  await call("ack", { nick: "erin", ts: sub.events[1].message.ts });
+  sub.sock.end();
+  sub = await subscribe("erin", { replay: true });
+  await wait(100);
+  assert.deepEqual(sub.events, []);
+  sub.sock.end();
+});
+
+test("a subscribe without replay gets only live events", async () => {
+  await call("register", { nick: "fred" });
+  await wait(5);
+  await call("dm", { from: "alice", to: "fred", text: "old" });
+  const sub = await subscribe("fred");
+  await wait(100);
+  assert.deepEqual(sub.events, []);
+  sub.sock.end();
+});
+
+test("a new nick gets no replay of history from before it existed", async () => {
+  await call("send", { from: "alice", channel: "general", text: "before gina" });
+  await wait(5);
+  await call("register", { nick: "gina" });
+  await call("join", { nick: "gina", channel: "general" });
+  const sub = await subscribe("gina", { replay: true });
+  await wait(100);
+  assert.ok(!sub.events.some((e) => e.message?.text === "before gina"));
+  sub.sock.end();
+});
+
+test("ack rejects unknown users and keeps the newest ts", async () => {
+  await assert.rejects(() => call("ack", { nick: "ghost", ts: 1 }), /unknown user/);
+  const r1 = await call("ack", { nick: "alice", ts: Date.now() + 1000 });
+  const r2 = await call("ack", { nick: "alice", ts: 5 });
+  assert.equal(r2.acked, r1.acked);
+});
+
+test("closing one of a nick's two connections leaves it online", async () => {
+  await call("register", { nick: "hank" });
+  const old = await subscribe("hank");
+  const cur = await subscribe("hank");
+  await call("status", { nick: "hank", status: "online" });
+  old.sock.end(); // a reconnect: the old socket closes after the new one is up
+  await wait(200);
+  let { users } = await call("users", {});
+  assert.equal(users.find((u) => u.nick === "hank").status, "online");
+  cur.sock.end();
+  await wait(200);
+  ({ users } = await call("users", {}));
+  assert.equal(users.find((u) => u.nick === "hank").status, "offline");
+});
+
+test("status with ifOffline keeps a status the agent set", async () => {
+  await call("register", { nick: "ivy" });
+  await call("status", { nick: "ivy", status: "busy", statusText: "deep in a fix" });
+  await call("status", { nick: "ivy", status: "online", statusText: "pi session", ifOffline: true });
+  let { users } = await call("users", {});
+  assert.equal(users.find((u) => u.nick === "ivy").statusText, "deep in a fix");
+  await call("status", { nick: "ivy", status: "offline" });
+  await call("status", { nick: "ivy", status: "online", statusText: "pi session", ifOffline: true });
+  ({ users } = await call("users", {}));
+  assert.equal(users.find((u) => u.nick === "ivy").status, "online");
 });

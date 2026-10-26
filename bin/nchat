@@ -9,12 +9,18 @@ const NICKS_DIR = NCHAT_DIR + "nicks";
 const NICK_FILE = NCHAT_DIR + "nick";
 
 // Identity: --as, else $NCHAT_NICK, else the nick of the agent session that
-// owns this process (found by walking up the process tree to its nick file:
-// nicks/<pid>, written by the pi extension and the Claude Code plugin), else,
-// only outside agent sessions, the legacy ~/.nchat/nick (the human's). An
-// agent whose session has no nick file gets an error, not the human's nick.
-// This keeps concurrent sessions' identities separate and prevents the
-// extension echoing the agent's own messages.
+// owns this process, else, only outside agent sessions, the legacy
+// ~/.nchat/nick (the human's). An agent whose session has no nick file gets
+// an error, not the human's nick.
+//
+// A session's nick lives in its session file, nicks/pi-<session id> (pi
+// extension) or nicks/cc-<session id> (Claude Code plugin): kept across
+// restarts and resumes, and watched by the session's listener, so
+// `nchat nick <new>` (or `nchat register <new>`) from inside the session
+// switches what it receives as too. The session is found from
+// $NCHAT_SESSION (the session file's name), else by walking up the process
+// tree to nicks/<pid> (the nick) and nicks/<pid>.session (the session file's
+// name), which the extension and the plugin write for their process.
 const basename = (a) => a.slice(a.lastIndexOf("/") + 1);
 function isAgent(pid) {
   try {
@@ -22,14 +28,39 @@ function isAgent(pid) {
     return argv.some((a) => ["pi", "claude"].includes(basename(a)));
   } catch { return false; }
 }
+const readFile = (f) => { try { return fs.readFileSync(f, "utf8").trim() || null; } catch { return null; } };
+// { nick, file (the session file, if known), pid (its nicks/<pid>, if found) },
+// or null outside agent sessions
+function agentSession() {
+  if (process.env.NCHAT_SESSION) {
+    const file = `${NICKS_DIR}/${process.env.NCHAT_SESSION}`;
+    const n = readFile(file);
+    if (n) return { nick: n, file, pid: null };
+  }
+  let pid = process.pid;
+  for (let hops = 0; hops < 64; hops++) {
+    const n = readFile(`${NICKS_DIR}/${pid}`);
+    if (n) {
+      const key = readFile(`${NICKS_DIR}/${pid}.session`);
+      const file = key ? `${NICKS_DIR}/${key}` : null;
+      return { nick: (file && readFile(file)) || n, file, pid };
+    }
+    try {
+      const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+      const ppid = parseInt(stat.slice(stat.lastIndexOf(")") + 2).trim().split(" ")[1], 10);
+      if (!ppid || ppid === pid) break;
+      pid = ppid;
+    } catch { break; }
+  }
+  return null;
+}
+const session = agentSession();
+
 function sessionNick() {
+  if (session) return session.nick;
   let pid = process.pid;
   let agent = false;
   for (let hops = 0; hops < 64; hops++) {
-    try {
-      const n = fs.readFileSync(`${NICKS_DIR}/${pid}`, "utf8").trim();
-      if (n) return n;
-    } catch {}
     agent ||= isAgent(pid);
     try {
       // /proc/<pid>/stat: fields after "(comm)": state, ppid, ...
@@ -49,7 +80,8 @@ const USAGE = `nchat — chat client for agents
 
 Usage:
   nchat hub [start|stop|restart|status]   Manage the hub daemon (default: start)
-  nchat register <nick>              Register a nickname
+  nchat register <nick>              Register a nickname (in an agent session: and become it)
+  nchat nick [new]                   Show this session's nick, or switch it (receiving too)
   nchat users                        List users and their statuses
   nchat join <channel> [--as nick]   Join a channel
   nchat part <channel> [--as nick]   Leave a channel
@@ -129,15 +161,42 @@ function parseArgs(argv) {
     else if (a === "--to") opts.to = argv[++i];
     else if (a === "--channel") opts.channel = argv[++i];
     else if (a === "--n") opts.n = parseInt(argv[++i], 10);
+    else if (a === "--follow") opts.follow = argv[++i];
     else opts._.push(a);
   }
   return opts;
 }
 
+// Make this agent session `next`: its session file (which its listener
+// watches) and pid file, registered, the old nick offline.
+async function becomeNick(next) {
+  if (!/^[a-zA-Z0-9_-]{1,32}$/.test(next || "")) throw new Error("invalid nickname (1-32 chars, alnum, _ or -)");
+  const old = session.nick;
+  await call("register", { nick: next, hostname: process.env.HOSTNAME || "local" });
+  await call("join", { nick: next, channel: "general" });
+  if (session.file) fs.writeFileSync(session.file, next + "\n");
+  if (session.pid) fs.writeFileSync(`${NICKS_DIR}/${session.pid}`, next + "\n");
+  if (old !== next) {
+    await call("status", { nick: next, status: "online" });
+    await call("status", { nick: old, status: "offline" }).catch(() => {});
+  }
+  session.nick = next;
+  if (!session.file) console.error("warning: this session's listener doesn't follow nick changes (no session file); restart it to receive as " + next);
+  if (process.env.NCHAT_NICK && process.env.NCHAT_NICK !== next) {
+    console.error(`warning: NCHAT_NICK=${process.env.NCHAT_NICK} is set in this shell and still wins for commands without --as`);
+  }
+}
+
+// commands that act as someone: warn when that isn't who the session receives as
+const ACTS = new Set(["join", "send", "msg", "react", "status", "sendfile"]);
+
 async function main() {
   const [cmd, ...rest] = process.argv.slice(2);
   const opts = parseArgs(rest);
   const me = opts.as || process.env.NCHAT_NICK || nick;
+  if (ACTS.has(cmd) && session && me && me !== session.nick) {
+    console.error(`warning: acting as ${me}, but this session receives messages as ${session.nick}; replies to ${me} won't reach it. Run: nchat nick ${me}`);
+  }
 
   switch (cmd) {
     case "hub": {
@@ -146,8 +205,31 @@ async function main() {
     }
     case "help": case undefined: console.log(USAGE); return;
     case "register": {
+      if (session && !opts.as && !process.env.NCHAT_NICK) {
+        await becomeNick(opts._[0]);
+        console.log(`registered as ${opts._[0]}; this session now sends and receives as ${opts._[0]}`);
+        return;
+      }
       const r = await call("register", { nick: opts._[0], hostname: process.env.HOSTNAME || "local" });
       console.log(`registered as ${r.user.nick}`);
+      return;
+    }
+    case "nick": {
+      if (!opts._[0]) {
+        if (!me) throw new Error("no identity: not in an agent session; specify --as <nick> or NCHAT_NICK");
+        const how = opts.as ? "--as" : process.env.NCHAT_NICK ? "NCHAT_NICK" : session ? `session ${session.file ? session.file.slice(NICKS_DIR.length + 1) : "pid " + session.pid}` : "~/.nchat/nick";
+        console.log(`${me} (${how})${session && session.nick !== me ? `; the session receives as ${session.nick}` : ""}`);
+        return;
+      }
+      if (!session) throw new Error("not in an agent session: use --as <nick> or NCHAT_NICK");
+      await becomeNick(opts._[0]);
+      console.log(`this session is now ${opts._[0]}`);
+      return;
+    }
+    case "ack": {
+      if (!me) throw new Error("specify --as <nick> or NCHAT_NICK");
+      const r = await call("ack", { nick: me, ts: Number(opts._[0]) });
+      console.log(`acked up to ${r.acked}`);
       return;
     }
     case "users": {
@@ -258,7 +340,7 @@ async function main() {
     }
     case "listen": {
       if (!me) throw new Error("specify --as <nick> or NCHAT_NICK");
-      await listen(me);
+      await listen(me, opts.follow);
       return;
     }
     default:
@@ -266,26 +348,48 @@ async function main() {
   }
 }
 
-async function listen(nick) {
+// Print the nick's events as JSON lines: first what came since its last ack
+// (replay), then live ones. Reconnects when the hub goes away (a restart).
+// --follow FILE: FILE holds the nick (a session file); when it changes, the
+// listener resubscribes as the new nick.
+async function listen(nick, follow) {
   const net = await import("node:net");
   const { SOCKET_PATH } = await import("../lib/common.js");
-  const sock = net.connect(SOCKET_PATH);
-  let buf = "";
-  sock.on("connect", () => sock.write(JSON.stringify({ id: "s", method: "subscribe", params: { nick } }) + "\n"));
-  sock.on("data", (d) => {
-    buf += d;
-    let idx;
-    while ((idx = buf.indexOf("\n")) !== -1) {
-      const line = buf.slice(0, idx); buf = buf.slice(idx + 1);
-      if (!line.trim()) continue;
-      let msg; try { msg = JSON.parse(line); } catch { continue; }
-      if (msg.event) console.log(JSON.stringify(msg));
-    }
-  });
-  sock.on("error", (e) => { console.error(`cannot reach hub: ${e.message}`); process.exit(1); });
-  process.on("SIGINT", () => sock.end());
+  let sock = null, retry = null, stopped = false;
+  const connect = () => {
+    retry = null;
+    const s = sock = net.connect(SOCKET_PATH);
+    let buf = "";
+    s.on("connect", () => s.write(JSON.stringify({ id: "s", method: "subscribe", params: { nick, replay: true } }) + "\n"));
+    s.on("data", (d) => {
+      if (s !== sock) return;
+      buf += d;
+      let idx;
+      while ((idx = buf.indexOf("\n")) !== -1) {
+        const line = buf.slice(0, idx); buf = buf.slice(idx + 1);
+        if (!line.trim()) continue;
+        let msg; try { msg = JSON.parse(line); } catch { continue; }
+        if (msg.event) console.log(JSON.stringify(msg));
+      }
+    });
+    s.on("error", () => {});
+    s.on("close", () => { if (s === sock && !stopped && !retry) retry = setTimeout(connect, 2000); });
+  };
+  connect();
+  if (follow) {
+    setInterval(() => {
+      const n = readFile(follow);
+      if (n && n !== nick && /^[a-zA-Z0-9_-]{1,32}$/.test(n)) {
+        nick = n;
+        const old = sock;
+        connect();
+        old?.destroy();
+      }
+    }, 1000);
+  }
+  process.on("SIGINT", () => { stopped = true; sock?.end(); process.exit(0); });
   // keep alive
-  setInterval(() => sock.write("\n"), 30000).unref();
+  setInterval(() => { if (sock?.writable) sock.write("\n"); }, 30000);
 }
 
 main().catch((e) => { console.error("error:", e.message); process.exit(1); });

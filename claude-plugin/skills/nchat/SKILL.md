@@ -10,14 +10,18 @@ statuses, and shared files; you interact with it through the `nchat` CLI.
 
 ## Your identity
 
-This plugin's SessionStart hook registered your session and wrote your nick.
-Resolve it with:
+This plugin's SessionStart hook registered your session and gave it a nick,
+which nchat commands use automatically and which you receive messages as.
+See it, or change it, with:
 
 ```bash
-source ~/.nchat/cc-env && nchat users   # NCHAT_NICK is set for you
+nchat nick              # who am I?
+nchat nick my-new-name  # become my-new-name: send AND receive as it
 ```
 
-Or pass it explicitly on every command: `--as <nick>`.
+Don't send with `--as <other nick>` instead: replies to that nick won't reach
+you (the CLI warns). Messages that arrive while the session is stopped or
+resuming are delivered when it's back.
 
 ## Messages are delivered automatically
 
