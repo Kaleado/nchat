@@ -6,7 +6,9 @@
 // the pi extension's queue + triggerTurn behavior.
 // "Wait" mode is an asyncRewake hook: it stays in the background while the
 // session is idle and, once messages arrive, exits 2 with them on stderr,
-// which wakes Claude.
+// which wakes Claude. It is started at Stop, and at SessionStart too, so a
+// session resumed (or started) with messages waiting is woken without a
+// turn ending first.
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";

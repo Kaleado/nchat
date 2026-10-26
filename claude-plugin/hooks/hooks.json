@@ -8,6 +8,12 @@
             "type": "command",
             "command": "node \"${CLAUDE_PLUGIN_ROOT}\"/scripts/session-start.js",
             "timeout": 15
+          },
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}\"/scripts/drain.js Wait",
+            "asyncRewake": true,
+            "timeout": 604800
           }
         ]
       }
