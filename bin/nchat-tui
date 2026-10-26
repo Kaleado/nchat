@@ -1,0 +1,418 @@
+#!/usr/bin/env node
+// nchat TUI — Ink (React) based. Sidebar shows channels + DM threads.
+// Keys: i/Esc toggle input, Up/Down or k/j switch conversation, Tab or l/h focus sidebar,
+// Enter (in sidebar) select, PgUp/PgDn scroll, Esc/Ctrl-C quit. /dm <nick> <text> sends a DM.
+import net from "node:net";
+import fs from "node:fs";
+import path from "node:path";
+import os from "node:os";
+import React, { useState, useEffect, useRef, useCallback } from "react";
+import { render, Box, Text, useStdout, useInput } from "ink";
+
+const e = React.createElement;
+
+const SOCKET_PATH = process.env.NCHAT_SOCKET || path.join(os.homedir(), ".nchat", "hub.sock");
+const readSessionNick = () => {
+  try { return fs.readFileSync(SOCKET_PATH.replace(/[^/]*$/, "nick"), "utf8").trim() || null; } catch { return null; }
+};
+const MY_NICK = process.env.NCHAT_NICK || readSessionNick() || process.env.USER || "human";
+
+function call(method, params) {
+  return new Promise((resolve, reject) => {
+    const sock = net.connect(SOCKET_PATH);
+    let buf = "";
+    sock.on("connect", () => sock.write(JSON.stringify({ id: "1", method, params }) + "\n"));
+    sock.on("data", (d) => {
+      buf += d;
+      const i = buf.indexOf("\n");
+      if (i !== -1) {
+        const msg = JSON.parse(buf.slice(0, i));
+        sock.end();
+        msg.error ? reject(new Error(msg.error)) : resolve(msg.result);
+      }
+    });
+    sock.on("error", reject);
+  });
+}
+
+// Word-wrap text to the given width (no ANSI codes inside, Ink handles color).
+function wrapText(text, width) {
+  const max = Math.max(10, width);
+  const out = [];
+  for (const para of String(text).split("\n")) {
+    const words = para.split(/\s+/).filter(Boolean);
+    if (!words.length) { out.push(""); continue; }
+    let line = "";
+    for (const w of words) {
+      if (!line) { line = w; continue; }
+      if (line.length + 1 + w.length <= max) line += " " + w;
+      else { out.push(line); line = w; }
+    }
+    // hard-break words longer than the width
+    while (line.length > max) { out.push(line.slice(0, max)); line = line.slice(max); }
+    if (line) out.push(line);
+  }
+  return out;
+}
+
+function App({ nick, onQuit }) {
+  const { stdout } = useStdout();
+  const width = stdout.columns || 80;
+  const height = stdout.rows || 24;
+
+  const [channels, setChannels] = useState([]);
+  const [users, setUsers] = useState([]);
+  const [dms, setDms] = useState([]); // dm keys "a|b"
+  const [active, setActive] = useState({ kind: "channel", name: "general" });
+  const [msgs, setMsgs] = useState([]);
+  const [mode, setMode] = useState("normal"); // normal | input
+  const [focus, setFocus] = useState("body"); // body | sidebar
+  const [input, setInput] = useState("");
+  const [scroll, setScroll] = useState(0);
+  const [statusLine, setStatusLine] = useState("");
+  const [sideIdx, setSideIdx] = useState(0);
+  const [jumpFilter, setJumpFilter] = useState("");
+  const [jumpIdx, setJumpIdx] = useState(0);
+
+  const activeRef = useRef(active);
+  const targetId = useRef(null);
+  activeRef.current = active;
+
+  // vterm (and other terminals) flicker when the full frame is rewritten, so
+  // only update state (and thus trigger a re-render) when data actually changed.
+  const setIfChanged = (setter, next) =>
+    setter((prev) => (JSON.stringify(prev) === JSON.stringify(next) ? prev : next));
+
+  const refresh = useCallback(async () => {
+    try {
+      const [ch, u, d] = await Promise.all([
+        call("channels", {}),
+        call("users", {}),
+        call("dms", {}),
+      ]);
+      setIfChanged(setChannels, ch.channels);
+      setIfChanged(setUsers, u.users);
+      setIfChanged(setDms, d.dms);
+      setStatusLine((s) => (s.startsWith("hub unreachable") ? "" : s));
+    } catch (err) { setStatusLine(`hub unreachable: ${err.message}`); }
+  }, []);
+
+  const loadHistory = useCallback(async (target) => {
+    try {
+      let h;
+      if (target.kind === "channel") {
+        h = await call("history", { channel: target.name, limit: 200 });
+      } else {
+        const [a, b] = target.name.split("|");
+        h = await call("dmHistory", { a, b, limit: 200 });
+        h = { messages: h.messages.map((m) => ({ ...m, text: `[dm] ${m.text}` })) };
+      }
+      setMsgs((prev) => (JSON.stringify(prev) === JSON.stringify(h.messages) ? prev : h.messages));
+    } catch (err) { setStatusLine(err.message); }
+  }, []);
+
+  // live events
+  useEffect(() => {
+    let stopped = false, sock = null, refreshTimer = null;
+    const refreshSoon = () => {
+      // coalesce bursts of events into one refresh; fewer full-frame redraws
+      if (refreshTimer) return;
+      refreshTimer = setTimeout(() => { refreshTimer = null; refresh(); }, 200);
+    };
+    const connect = () => {
+      if (stopped) return;
+      sock = net.connect(SOCKET_PATH);
+      let buf = "";
+      sock.on("connect", () => sock.write(JSON.stringify({ id: "s", method: "subscribe", params: { nick } }) + "\n"));
+      sock.on("data", (d) => {
+        buf += d;
+        let i;
+        while ((i = buf.indexOf("\n")) !== -1) {
+          const line = buf.slice(0, i); buf = buf.slice(i + 1);
+          let msg; try { msg = JSON.parse(line); } catch { continue; }
+          if (!msg.event) continue;
+          const m = msg.message;
+          if (msg.event === "message" && m?.channel === activeRef.current?.name) setMsgs((prev) => [...prev, m]);
+          if (msg.event === "dm" && m) {
+            setMsgs((prev) => [...prev, { ...m, text: `[dm from ${m.from}] ${m.text}` }]);
+            refreshSoon(); // new dm thread may appear in sidebar
+          }
+          if (msg.event === "file" && msg.file) setMsgs((prev) => [...prev, { ts: Date.now(), from: msg.file.from, text: `shared file: ${msg.file.name}` }]);
+          if (msg.event === "reaction") refreshSoon(); // reload so reaction counts update
+          if (msg.event === "presence") setStatusLine(`${msg.nick} is ${msg.status}`);
+        }
+      });
+      sock.on("error", () => sock.end());
+      sock.on("close", () => { if (!stopped) setTimeout(connect, 3000); });
+    };
+    connect();
+    const iv = setInterval(refresh, 10000);
+    return () => { stopped = true; clearInterval(iv); sock?.end(); };
+  }, [nick, refresh]);
+
+  // load history when switching conversation
+  useEffect(() => { setScroll(0); loadHistory(active); }, [active, loadHistory]);
+
+  // auto-join general + first refresh
+  useEffect(() => {
+    (async () => {
+      try { await call("register", { nick, hostname: os.hostname() }); await call("join", { nick, channel: "general" }); } catch {}
+      await refresh();
+    })();
+  }, [nick, refresh]);
+
+  const handleCommand = useCallback((cmd) => {
+    const [c, ...rest] = cmd.slice(1).split(/\s+/);
+    const arg = rest.join(" ");
+    if (c === "help") setStatusLine("commands: /join <ch> /part <ch> /dm <nick> <text> /who /status <st> <text> /quit");
+    else if (c === "who") {
+      call("users", {})
+        .then(({ users: us }) => {
+          const list = us.length
+            ? us.map((u) => `${u.nick} (${u.status}${u.statusText ? ": " + u.statusText : ""})`).join(", ")
+            : "no users registered";
+          setMsgs((prev) => [...prev, { ts: Date.now(), from: "system", text: `users: ${list}` }]);
+        })
+        .catch((err) => setStatusLine(err.message));
+    }
+    else if (c === "join" && arg) call("join", { nick, channel: arg }).then(refresh).catch((err) => setStatusLine(err.message));
+    else if (c === "part" && arg) call("part", { nick, channel: arg }).then(refresh);
+    else if (c === "dm" && arg) {
+      const [to, ...txt] = arg.split(/\s+/);
+      if (!to || !txt.length) return setStatusLine("usage: /dm <nick> <text>");
+      call("dm", { from: nick, to, text: txt.join(" ") })
+        .then(() => { setActive({ kind: "dm", name: [nick, to].sort().join("|") }); })
+        .catch((err) => setStatusLine(err.message));
+    }
+    else if (c === "status") {
+      const [st, ...txt] = arg.split(/\s+/);
+      call("status", { nick, status: st, statusText: txt.join(" ") }).then(refresh);
+    }
+    else if (c === "quit") onQuit();
+    else setStatusLine(`unknown command ${c}`);
+  }, [nick, refresh, onQuit]);
+
+  const submit = useCallback(async () => {
+    const text = input.trim();
+    setInput("");
+    setMode("normal");
+    if (!text) return;
+    if (text.startsWith("/")) return handleCommand(text);
+    try {
+      if (activeRef.current.kind === "channel") {
+        await call("send", { from: nick, channel: activeRef.current.name, text });
+      } else {
+        const [a, b] = activeRef.current.name.split("|");
+        const to = a === nick ? b : a;
+        await call("dm", { from: nick, to, text });
+      }
+    } catch (err) { setStatusLine(err.message); }
+  }, [input, nick, handleCommand]);
+
+  // sidebar entries: channels + dm threads
+  const entries = [
+    ...channels.map((c) => ({ kind: "channel", name: c.name, label: `#${c.name}` })),
+    ...dms.map((key) => {
+      const [a, b] = key.split("|");
+      const other = a === nick ? b : a;
+      return { kind: "dm", name: key, label: `@${other}` + (a !== nick && b !== nick ? ` (${a} + ${b})` : "") };
+    }),
+  ];
+
+  const matches = entries.filter((t) => (t.label + " " + t.name).toLowerCase().includes(jumpFilter.toLowerCase()));
+  const jumpSel = Math.min(jumpIdx, Math.max(0, matches.length - 1));
+
+  useInput((ch, key) => {
+    if (key.ctrl && key.name === "c") return onQuit();
+    // ctrl-k: quick switcher (from any mode)
+    if (key.ctrl && ch === "k") { setMode("jump"); setJumpFilter(""); setJumpIdx(0); return; }
+    if (mode === "jump") {
+      if (key.escape) { setMode("normal"); setJumpFilter(""); return; }
+      if (key.return) {
+        const t = matches[jumpSel];
+        setMode("normal"); setJumpFilter("");
+        if (t) { setActive({ kind: t.kind, name: t.name }); setFocus("body"); }
+        return;
+      }
+      if (key.upArrow) return setJumpIdx((i) => Math.max(0, i - 1));
+      if (key.downArrow) return setJumpIdx((i) => i + 1);
+      if (key.backspace || key.delete) return setJumpFilter((v) => v.slice(0, -1));
+      if (ch && !key.ctrl && !key.meta) setJumpFilter((v) => v + ch);
+      return;
+    }
+    if (mode === "react") {
+      if (key.escape) { setMode("normal"); setInput(""); return; }
+      if (key.tab) { setFocus("sidebar"); setMode("normal"); return; }
+      if (key.return) {
+        const reaction = input.trim().replace(/^\(|\)$/g, "");
+        setInput(""); setMode("normal");
+        if (!reaction) return;
+        const conv = activeRef.current;
+        const params = conv.kind === "channel"
+          ? { by: nick, channel: conv.name, messageId: targetId.current, reaction }
+          : { by: nick, to: conv.name.split("|").find((n) => n !== nick) || nick, messageId: targetId.current, reaction };
+        call("react", params).then(refresh).catch((err) => setStatusLine(err.message));
+        return;
+      }
+      if (key.backspace || key.delete) return setInput((v) => v.slice(0, -1));
+      if (ch && !key.ctrl && !key.meta) setInput((v) => v + ch);
+      return;
+    }
+    if (mode === "input") {
+      if (key.escape) { setMode("normal"); setInput(""); return; }
+      // Tab leaves the input (text kept) and moves focus to the sidebar,
+      // so sidebar navigation actually works afterwards.
+      if (key.tab) { setFocus("sidebar"); setMode("normal"); return; }
+      if (key.return) return submit();
+      if (key.backspace || key.delete) return setInput((v) => v.slice(0, -1));
+      if (ch && !key.ctrl && !key.meta) setInput((v) => v + ch);
+      return;
+    }
+    // normal mode
+    if (key.escape) return onQuit();
+    if (key.tab) { setFocus((f) => (f === "body" ? "sidebar" : "body")); return; }
+    if (ch === "l") { setFocus("sidebar"); return; }
+    if (ch === "h") { setFocus("body"); return; }
+    if (ch === "i") { setMode("input"); return; } // resume editing, keep text
+    if (ch === "r") {
+      // react to the latest message that isn't ours or a system notice
+      const target = [...msgs].reverse().find((m) => m.from !== nick && m.from !== "system");
+      if (!target) { setStatusLine("nothing to react to"); return; }
+      targetId.current = target.id;
+      setStatusLine(`react to <${target.from}> ${String(target.text).slice(0, 40)}`);
+      setMode("react");
+      setInput("");
+      return;
+    }
+    if (focus === "body") {
+      if (key.upArrow || ch === "k") return setScroll((s) => s + 3);
+      if (key.downArrow || ch === "j") return setScroll((s) => Math.max(0, s - 3));
+      if (key.pageUp) return setScroll((s) => s + (height - 8));
+      if (key.pageDown) return setScroll((s) => Math.max(0, s - (height - 8)));
+      // printable key: auto-enter input mode (Slack-style)
+      if (ch && !key.ctrl && !key.meta && !key.return) { setMode("input"); setInput(ch); return; }
+      return;
+    }
+    // sidebar navigation
+    if (key.upArrow || ch === "k") return setSideIdx((i) => Math.max(0, i - 1));
+    if (key.downArrow || ch === "j") return setSideIdx((i) => Math.min(entries.length - 1, i + 1));
+    if (key.return || ch === "l") {
+      const t = entries[sideIdx];
+      if (t) setActive({ kind: t.kind, name: t.name });
+      return;
+    }
+    if (ch === "h") { setFocus("body"); return; }
+  });
+
+  // ----- layout -----
+  const sidebarW = Math.min(36, Math.max(20, Math.floor(width / 4)));
+  const bodyW = width - sidebarW;
+  const bodyH = Math.max(3, height - 7);
+  const me = users.find((u) => u.nick === nick);
+
+  // overfetch so wrapped lines don't starve the view
+  const view = msgs.slice(-(bodyH * 3 + scroll)).slice(0, bodyH * 3);
+
+  const bodyLines = [];
+  for (const m of view) {
+    const ts = new Date(m.ts).toTimeString().slice(0, 5);
+    // reactions render as a summary appended to the message text
+    const rx = m.reactions ? "  " + Object.entries(m.reactions).map(([k, v]) => `[${k} x${v.length}]`).join(" ") : "";
+    const prefix = `${ts} <${m.from}> `;
+    const wrapped = wrapText(m.text + rx, Math.max(20, bodyW - prefix.length - 1));
+    wrapped.forEach((w, i) => {
+      bodyLines.push({ ts, from: i === 0 ? m.from : "", text: w, mine: m.from === nick, system: m.from === "system" });
+    });
+  }
+  const shown = bodyLines.slice(-bodyH);
+  const pad = Array.from({ length: Math.max(0, bodyH - shown.length) });
+
+  const inputTail = (s, max) => {
+    const m = Math.max(10, max);
+    return s.length > m ? "..." + s.slice(-(m - 3)) : s;
+  };
+
+  // sidebar entry label: always truncated in place; the full name is shown by
+  // a horizontal overlay (see below) when the sidebar is focused, so expanded
+  // entries never grow the sidebar vertically.
+  const truncLabel = (t) => {
+    const max = Math.max(6, sidebarW - 5); // border(2) + bullet(2) + slack
+    return "  " + (t.label.length > max ? t.label.slice(0, max - 3) + "..." : t.label);
+  };
+  const nickColor = (l) => (l.system ? "yellow" : l.mine ? "green" : "cyan");
+
+  return e(Box, { flexDirection: "row", width },
+    // sidebar (border highlights when focused)
+    e(Box, { key: "side", flexDirection: "column", width: sidebarW, borderStyle: "single", borderColor: focus === "sidebar" ? "cyan" : undefined },
+      ...entries.map((t, i) => e(Text, {
+        key: `${t.kind}:${t.name}`,
+        inverse: focus === "sidebar" && i === sideIdx,
+        color: active.kind === t.kind && active.name === t.name ? "cyan" : undefined,
+      }, truncLabel(t))),
+      e(Text, { dimColor: true }, ""),
+      e(Text, { dimColor: true }, "users:"),
+      ...users.filter((u) => u.status !== "offline").slice(0, Math.max(0, height - 9 - entries.length)).map((u) => e(Text, { key: u.nick },
+        ` * ${u.nick}`)),
+    ),
+    // main pane (title highlights when focused)
+    e(Box, { key: "main", flexDirection: "column", width: bodyW },
+      e(Text, { key: "title", inverse: true, bold: true, color: focus === "body" ? "cyan" : undefined },
+        (() => {
+          if (active.kind === "channel") return ` #${active.name} `;
+          const [a, b] = active.name.split("|");
+          const other = a === nick ? b : a;
+          return (a !== nick && b !== nick ? ` @${a} + ${b} ` : ` @${other} `);
+        })().padEnd(bodyW)),
+      e(Text, { key: "you", color: "cyan" }, `you: ${nick} `,
+        me ? e(Text, { dimColor: true }, `(${me.status} ${me.statusText}) `) : null,
+        e(Text, { dimColor: true }, statusLine)),
+      e(Text, { key: "sep", dimColor: true }, "─".repeat(bodyW)),
+      e(Box, { key: "body", flexDirection: "column", height: bodyH },
+        ...pad.map((_, i) => e(Text, { key: `p${i}` }, "")),
+        ...shown.map((l, i) => e(Text, { key: `l${i}` },
+          e(Text, { dimColor: true }, l.ts + " "),
+          l.from ? e(Text, { color: nickColor(l), bold: true }, `<${l.from}> `) : e(Text, { dimColor: true }, "  "),
+          e(Text, { color: l.system ? "yellow" : l.mine ? "green" : undefined, dimColor: !l.mine && !l.system }, l.text))),
+      ),
+      e(Text, { key: "sep2", dimColor: true }, "─".repeat(bodyW)),
+      e(Box, { key: "in" },
+        e(Text, { bold: mode !== "normal" }, (mode === "jump" ? "jump> " + jumpFilter : mode === "react" ? "react> " : "> ") + (mode === "jump" ? "" : inputTail(input, bodyW - 10))),
+        mode !== "normal" ? e(Text, { bold: true }, mode === "jump" ? "" : "█") : null),
+      e(Text, { key: "foot", dimColor: true },
+        "Tab: focus " + (focus === "body" ? "sidebar" : "conversation") + "  Ctrl-K: jump  ↑↓: select  i/Esc: input  r: react  k/j: scroll  /dm <nick> <text>  Ctrl-C: quit"),
+    ),
+    // expanded sidebar label: absolute overlay drawn last so it covers the
+    // message panel horizontally when an entry is highlighted in the sidebar
+    focus === "sidebar" && entries[sideIdx]
+      ? e(Box, { key: "overlay", position: "absolute", top: 1 + sideIdx, left: 1 },
+          e(Text, { inverse: true, color: "cyan" },
+            // expand only as far as the row's contents need, not to a max width
+            (active.kind === entries[sideIdx].kind && active.name === entries[sideIdx].name ? "> " : "  ")
+            + entries[sideIdx].label
+            + "  "))
+      : null,
+    // ctrl-k jump switcher popup: drawn last so it overlays the message panel
+    mode === "jump"
+      ? e(Box, { key: "jump", position: "absolute", top: Math.max(0, height - 6 - Math.min(7, matches.length + 1)), left: sidebarW },
+          e(Box, { flexDirection: "column", borderStyle: "single", width: Math.max(24, Math.min(50, bodyW - 2)) },
+            e(Text, { bold: true }, `jump to: ${jumpFilter}`),
+            ...(matches.length
+              ? matches.slice(0, 6).map((t, i) => e(Text, { key: `${t.kind}:${t.name}`, inverse: i === jumpSel,
+                  color: active.kind === t.kind && active.name === t.name ? "cyan" : undefined }, t.label))
+              : [e(Text, { key: "none", dimColor: true }, "no matches")])))
+      : null,
+    // sidebar title bar sits ON the top border row (not inset inside the frame)
+    e(Box, { key: "side-title", position: "absolute", top: 0, left: 0 },
+      e(Text, null,
+        "┌",
+        e(Text, { inverse: true, bold: true, color: focus === "sidebar" ? "cyan" : undefined },
+          " nchat - channels ".padEnd(Math.max(0, sidebarW - 2))),
+        "┐")),
+  );
+}
+
+const instance = render(e(App, { nick: MY_NICK, onQuit: () => {
+  instance.unmount();
+  process.stdout.write("\x1b[0m\x1b[?25h");
+  process.exit(0);
+} }), { exitOnCtrlC: false, incrementalRendering: true });

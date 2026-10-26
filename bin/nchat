@@ -1,0 +1,291 @@
+#!/usr/bin/env node
+// nchat CLI — the agent interface to the hub.
+import { call } from "../lib/common.js";
+import fs from "node:fs";
+
+const NCHAT_DIR = (process.env.NCHAT_SOCKET || (process.env.HOME || "") + "/.nchat/hub.sock")
+  .replace(/[^/]*$/, "");
+const NICKS_DIR = NCHAT_DIR + "nicks";
+const NICK_FILE = NCHAT_DIR + "nick";
+
+// Identity: --as, else $NCHAT_NICK, else the nick of the agent session that
+// owns this process (found by walking up the process tree to its nick file:
+// nicks/<pid>, written by the pi extension and the Claude Code plugin), else,
+// only outside agent sessions, the legacy ~/.nchat/nick (the human's). An
+// agent whose session has no nick file gets an error, not the human's nick.
+// This keeps concurrent sessions' identities separate and prevents the
+// extension echoing the agent's own messages.
+const basename = (a) => a.slice(a.lastIndexOf("/") + 1);
+function isAgent(pid) {
+  try {
+    const argv = fs.readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0").filter(Boolean);
+    return argv.some((a) => ["pi", "claude"].includes(basename(a)));
+  } catch { return false; }
+}
+function sessionNick() {
+  let pid = process.pid;
+  let agent = false;
+  for (let hops = 0; hops < 64; hops++) {
+    try {
+      const n = fs.readFileSync(`${NICKS_DIR}/${pid}`, "utf8").trim();
+      if (n) return n;
+    } catch {}
+    agent ||= isAgent(pid);
+    try {
+      // /proc/<pid>/stat: fields after "(comm)": state, ppid, ...
+      const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+      const ppid = parseInt(stat.slice(stat.lastIndexOf(")") + 2).trim().split(" ")[1], 10);
+      if (!ppid || ppid === pid) break;
+      pid = ppid;
+    } catch { break; }
+  }
+  if (agent) return null;
+  try { return fs.readFileSync(NICK_FILE, "utf8").trim() || null; } catch { return null; }
+}
+
+const nick = process.env.NCHAT_NICK || sessionNick() || null;
+
+const USAGE = `nchat — chat client for agents
+
+Usage:
+  nchat hub [start|stop|restart|status]   Manage the hub daemon (default: start)
+  nchat register <nick>              Register a nickname
+  nchat users                        List users and their statuses
+  nchat join <channel> [--as nick]   Join a channel
+  nchat part <channel> [--as nick]   Leave a channel
+  nchat channels                     List channels
+  nchat topic <channel> [text]       Get or set channel topic
+  nchat send <channel> <text...>     Send a message to a channel
+  nchat msg <nick> <text...>         Send a direct message
+  nchat react <reaction> <id-prefix> [--channel c | --to nick]  React to a message
+                                         reactions: ok error in-progress done todo question star eyes fire
+  nchat history <channel> [--n N]    Read channel history
+  nchat dmhistory <nick> [--n N]     Read DM history with nick
+  nchat status [online|away|busy] [text]  Set your status
+  nchat whoami [nick]                Show user info
+  nchat sendfile <path> [--channel c | --to nick]  Share a file
+  nchat files                        List shared files
+  nchat listen [--as nick]           Subscribe to live events (blocks)
+  nchat help                         This help
+
+Set NCHAT_NICK or pass --as <nick> to act as an identity.
+Use "nchat listen" in the background to receive notifications.
+`;
+
+async function hubCommand(sub) {
+  const { spawn } = await import("node:child_process");
+  const { fileURLToPath } = await import("node:url");
+  const { readHubPid, stopHubProcess } = await import("../lib/common.js");
+  const hubJs = fileURLToPath(new URL("../lib/hub.js", import.meta.url));
+
+  const start = async () => {
+    const existing = readHubPid();
+    if (existing) { console.log(`hub already running (pid ${existing})`); return; }
+    const child = spawn(process.execPath, [hubJs], { detached: true, stdio: "ignore" });
+    child.unref();
+    // wait for the socket to come up
+    const { SOCKET_PATH } = await import("../lib/common.js");
+    const net = await import("node:net");
+    const deadline = Date.now() + 4000;
+    while (Date.now() < deadline) {
+      const up = await new Promise((resolve) => {
+        const s = net.connect(SOCKET_PATH);
+        s.on("connect", () => { s.end(); resolve(true); });
+        s.on("error", () => resolve(false));
+      });
+      if (up) { console.log(`hub started (pid ${child.pid})`); return; }
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    console.error("hub failed to start (no socket within 4s)");
+    process.exitCode = 1;
+  };
+
+  const stop = async () => {
+    const r = await stopHubProcess();
+    console.log(r.stopped ? `hub stopped (pid ${r.pid})` : `hub ${r.reason}`);
+    if (!r.stopped && r.reason === "not running") process.exitCode = 1;
+  };
+
+  const status = () => {
+    const pid = readHubPid();
+    console.log(pid ? `running (pid ${pid})` : "not running");
+    if (!pid) process.exitCode = 1;
+  };
+
+  switch (sub) {
+    case "start": return start();
+    case "stop": return stop();
+    case "restart": { const r = await stopHubProcess(); if (r.stopped) console.log(`hub stopped (pid ${r.pid})`); await start(); return; }
+    case "status": return status();
+    default: throw new Error(`unknown hub command: ${sub} (use start|stop|restart|status)`);
+  }
+}
+
+function parseArgs(argv) {
+  const opts = { _: [] };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--as") opts.as = argv[++i];
+    else if (a === "--to") opts.to = argv[++i];
+    else if (a === "--channel") opts.channel = argv[++i];
+    else if (a === "--n") opts.n = parseInt(argv[++i], 10);
+    else opts._.push(a);
+  }
+  return opts;
+}
+
+async function main() {
+  const [cmd, ...rest] = process.argv.slice(2);
+  const opts = parseArgs(rest);
+  const me = opts.as || process.env.NCHAT_NICK || nick;
+
+  switch (cmd) {
+    case "hub": {
+      await hubCommand(opts._[0] || "start");
+      return;
+    }
+    case "help": case undefined: console.log(USAGE); return;
+    case "register": {
+      const r = await call("register", { nick: opts._[0], hostname: process.env.HOSTNAME || "local" });
+      console.log(`registered as ${r.user.nick}`);
+      return;
+    }
+    case "users": {
+      const { users } = await call("users", {});
+      for (const u of users) console.log(`${u.nick.padEnd(16)} ${u.status.padEnd(8)} ${u.statusText}`);
+      return;
+    }
+    case "join": {
+      if (!me) throw new Error("specify --as <nick> or NCHAT_NICK");
+      await call("register", { nick: me, hostname: process.env.HOSTNAME || "local" });
+      await call("join", { nick: me, channel: opts._[0] });
+      console.log(`joined #${opts._[0]}`);
+      return;
+    }
+    case "part": {
+      if (!me) throw new Error("specify --as <nick> or NCHAT_NICK");
+      await call("part", { nick: me, channel: opts._[0] });
+      console.log(`left #${opts._[0]}`);
+      return;
+    }
+    case "channels": {
+      const { channels } = await call("channels", {});
+      for (const c of channels) console.log(`#${c.name.padEnd(20)} ${String(c.members.length).padStart(3)} members  ${c.topic}`);
+      return;
+    }
+    case "topic": {
+      if (opts._[1]) {
+        await call("topic", { channel: opts._[0], topic: opts._.slice(1).join(" "), by: me || "unknown" });
+      } else {
+        const { channels } = await call("channels", {});
+        const c = channels.find((c) => c.name === opts._[0]);
+        console.log(c ? c.topic : `#${opts._[0]} not found`);
+      }
+      return;
+    }
+    case "send": {
+      if (!me) throw new Error("specify --as <nick> or NCHAT_NICK");
+      const r = await call("send", { from: me, channel: opts._[0], text: opts._.slice(1).join(" ") });
+      console.log(`sent to #${opts._[0]} [${r.message.id}]`);
+      return;
+    }
+    case "msg": {
+      if (!me) throw new Error("specify --as <nick> or NCHAT_NICK");
+      await call("dm", { from: me, to: opts._[0], text: opts._.slice(1).join(" ") });
+      console.log(`dm sent to ${opts._[0]}`);
+      return;
+    }
+    case "react": {
+      if (!me) throw new Error("specify --as <nick> or NCHAT_NICK");
+      if (!opts._[0] || !opts._[1]) throw new Error("usage: nchat react <reaction> <id-prefix> [--channel c | --to nick]");
+      const reaction = opts._[0].replace(/^\(|\)$/g, ""); // accept (ok) or ok
+      const prefix = opts._[1];
+      const scope = opts.to ? { to: opts.to } : { channel: opts.channel || "general" };
+      const { messages } = scope.to
+        ? await call("dmHistory", { a: me, b: scope.to, limit: 200 })
+        : await call("history", { channel: scope.channel, limit: 200 });
+      const matches = messages.filter((m) => m.id.startsWith(prefix));
+      if (matches.length === 0) throw new Error(`no message with id prefix "${prefix}"`);
+      if (matches.length > 1) throw new Error(`id prefix "${prefix}" is ambiguous (${matches.length} matches)`);
+      const r = await call("react", { by: me, ...scope, messageId: matches[0].id, reaction });
+      const sum = Object.entries(r.message.reactions || {}).map(([k, v]) => `(${k}) x${v.length}`).join(" ") || "(none)";
+      console.log(`reaction ${sum} on [${matches[0].id}]`);
+      return;
+    }
+    case "history": {
+      const { messages } = await call("history", { channel: opts._[0], limit: opts.n || 100 });
+      for (const m of messages) {
+        const t = new Date(m.ts).toISOString().slice(11, 19);
+        const rx = m.reactions ? "  " + Object.entries(m.reactions).map(([k, v]) => `(${k}) x${v.length}`).join(" ") : "";
+        console.log(`[${t}] [${m.id}] ${m.from}: ${m.text}${rx}`);
+      }
+      return;
+    }
+    case "dmhistory": {
+      if (!me) throw new Error("specify --as <nick> or NCHAT_NICK");
+      const { messages } = await call("dmHistory", { a: me, b: opts._[0], limit: opts.n || 100 });
+      for (const m of messages) {
+        const t = new Date(m.ts).toISOString().slice(11, 19);
+        const rx = m.reactions ? "  " + Object.entries(m.reactions).map(([k, v]) => `(${k}) x${v.length}`).join(" ") : "";
+        console.log(`[${t}] [${m.id}] ${m.from} -> ${m.to}: ${m.text}${rx}`);
+      }
+      return;
+    }
+    case "status": {
+      if (!me) throw new Error("specify --as <nick> or NCHAT_NICK");
+      const [st, ...txt] = opts._;
+      await call("status", { nick: me, status: st || "online", statusText: txt.join(" ") });
+      console.log(`status set: ${st || "online"} ${txt.join(" ")}`);
+      return;
+    }
+    case "whoami": {
+      const { user } = await call("whoami", { nick: opts._[0] || me });
+      console.log(JSON.stringify(user, null, 2));
+      return;
+    }
+    case "sendfile": {
+      if (!me) throw new Error("specify --as <nick> or NCHAT_NICK");
+      const p = opts._[0];
+      const stat = fs.statSync(p);
+      const r = await call("sendFile", { from: me, channel: opts.channel, to: opts.to, name: p, size: stat.size, path: p });
+      console.log(`file shared [${r.fileId}] -> ${opts.to ? opts.to : "#" + opts.channel}`);
+      return;
+    }
+    case "files": {
+      const { files } = await call("files", {});
+      for (const f of files) console.log(`[${f.id}] ${f.name} (${f.size}b) from ${f.from} -> ${f.to ? "@" + f.to : "#" + f.channel}`);
+      return;
+    }
+    case "listen": {
+      if (!me) throw new Error("specify --as <nick> or NCHAT_NICK");
+      await listen(me);
+      return;
+    }
+    default:
+      throw new Error(`unknown command: ${cmd}\n${USAGE}`);
+  }
+}
+
+async function listen(nick) {
+  const net = await import("node:net");
+  const { SOCKET_PATH } = await import("../lib/common.js");
+  const sock = net.connect(SOCKET_PATH);
+  let buf = "";
+  sock.on("connect", () => sock.write(JSON.stringify({ id: "s", method: "subscribe", params: { nick } }) + "\n"));
+  sock.on("data", (d) => {
+    buf += d;
+    let idx;
+    while ((idx = buf.indexOf("\n")) !== -1) {
+      const line = buf.slice(0, idx); buf = buf.slice(idx + 1);
+      if (!line.trim()) continue;
+      let msg; try { msg = JSON.parse(line); } catch { continue; }
+      if (msg.event) console.log(JSON.stringify(msg));
+    }
+  });
+  sock.on("error", (e) => { console.error(`cannot reach hub: ${e.message}`); process.exit(1); });
+  process.on("SIGINT", () => sock.end());
+  // keep alive
+  setInterval(() => sock.write("\n"), 30000).unref();
+}
+
+main().catch((e) => { console.error("error:", e.message); process.exit(1); });

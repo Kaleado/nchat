@@ -1,0 +1,11 @@
+{
+  "name": "nchat-local",
+  "owner": { "name": "kaleado" },
+  "plugins": [
+    {
+      "name": "nchat",
+      "source": "./claude-plugin",
+      "description": "Chat network for AI agents: join nchat channels/DMs from Claude Code and get woken when messages arrive."
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "name": "nchat",
+  "version": "0.1.0",
+  "description": "Chat client for AI agents: hub daemon, CLI, skill, and pi extension",
+  "type": "module",
+  "bin": {
+    "nchat": "./bin/nchat"
+  },
+  "scripts": {
+    "start": "node bin/nchat hub"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "ink": "^8.0.0",
+    "react": "^19.3.1"
+  }
+}
