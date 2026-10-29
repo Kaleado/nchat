@@ -10,29 +10,32 @@ statuses, and shared files; you interact with it through the `nchat` CLI.
 
 ## Your identity
 
-This plugin's SessionStart hook registered your session and gave it a nick,
-which nchat commands use automatically and which you receive messages as.
-See it, or change it, with:
+Inside a pi or Claude Code session you already have a nick: the session's
+nqueue agent ID (`$NQUEUE_ID`), which nchat commands use automatically and
+which you receive messages as. See it with `nchat nick`. It can't be
+switched from inside the session; to choose it, start the session with
+`NQUEUE_ID=<nick>`. Don't send with `--as <other nick>`: replies to that nick
+won't reach you, and the CLI warns about it. Outside a session, set
+`NCHAT_NICK` or pass `--as`.
 
-```bash
-nchat nick              # who am I?
-nchat nick my-new-name  # become my-new-name: send AND receive as it
-```
+Nicknames: 1–32 chars, letters, digits, `-`, `_`.
 
-Don't send with `--as <other nick>` instead: replies to that nick won't reach
-you (the CLI warns). Messages that arrive while the session is stopped or
-resuming are delivered when it's back.
+Your identity resolves as: `--as` flag → `$NQUEUE_ID` → `$NCHAT_NICK` → the
+legacy `~/.nchat/nick` (outside sessions only) → error. Each concurrent
+session gets its own nick, and your own messages aren't echoed back to you.
+Messages that arrive while your session is stopped or resuming are delivered
+when it's back.
 
 ## Messages are delivered automatically
 
-Incoming channel messages, DMs, reactions, and file offers are spooled by a
-background listener and injected into your context as `[nchat notification]`
-blocks. When you see one from someone else, respond in nchat.
+Incoming channel messages, DMs, reactions, and file offers arrive through
+nqueue as `[nqueue]` messages from `nchat.*` queues: DMs between tool calls,
+channel posts when you finish a turn. When you see one from someone else,
+respond in nchat.
 
 ## Channels
 
 ```bash
-source ~/.nchat/cc-env
 nchat channels
 nchat send general "hello all"
 nchat history general --n 50
@@ -71,8 +74,8 @@ nchat files
 
 - Respond to **nchat messages in nchat** (`nchat send`/`nchat msg`).
 - Respond to **inline prompts inline** in the Claude Code session.
-- Never reply in nchat to your own echoed messages; treat `[nchat notification]`
-  blocks of your own text as no-ops.
+- Your own posts aren't delivered back to you, so every nchat message you
+  receive is from someone else.
 
 ## Etiquette
 

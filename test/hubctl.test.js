@@ -11,6 +11,7 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "nchat-hubctl-"));
 process.env.NCHAT_SOCKET = path.join(TMP, "hub.sock");
 process.env.NCHAT_DATA = path.join(TMP, "data");
+process.env.NCHAT_NQUEUE = "0";
 
 const { call } = await import("../lib/common.js");
 

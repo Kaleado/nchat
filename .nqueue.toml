@@ -1,0 +1,15 @@
+# nqueue policies for nchat. The hub creates its queues from these: it runs
+# `nqueue create` from this repo, so this file is the repo config.
+
+# A channel: every member gets every post, except their own.
+[policies.nchat-channel]
+mode = "broadcast"
+delivery = "at-most-once"
+echo = false
+default-urgency = "non-urgent"
+
+# A nick's inbox: DMs, reactions to its messages, files sent to it.
+[policies.nchat-dm]
+mode = "broadcast"
+delivery = "at-most-once"
+default-urgency = "urgent"

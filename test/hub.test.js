@@ -9,6 +9,7 @@ import os from "node:os";
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "nchat-test-"));
 process.env.NCHAT_SOCKET = path.join(TMP, "hub.sock");
 process.env.NCHAT_DATA = path.join(TMP, "data");
+process.env.NCHAT_NQUEUE = "0"; // delivery through nqueue is tested in nqueue.test.js
 
 const { startHub, stopHub } = await import("../lib/hub.js");
 const { call } = await import("../lib/common.js");
@@ -173,59 +174,20 @@ test("unknown method returns error", async () => {
 
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
-test("a subscribe with replay gets what came while away, until acked", async () => {
-  await call("register", { nick: "erin" });
-  await call("join", { nick: "erin", channel: "away1" });
-  await wait(5); // the DM and post below are newer than erin's ack
-  // nobody listening as erin: a live-only hub would lose these
-  await call("dm", { from: "alice", to: "erin", text: "while you were out" });
-  await call("send", { from: "alice", channel: "away1", text: "posted while away" });
-  await call("send", { from: "erin", channel: "away1", text: "my own" });
-  let sub = await subscribe("erin", { replay: true });
-  await wait(100);
-  const got = sub.events.map((e) => e.message?.text);
-  assert.deepEqual(got, ["while you were out", "posted while away"]);
-  assert.ok(sub.events.every((e) => e.replay === true));
-  assert.equal(sub.events[1].channel, "away1");
-  sub.sock.end();
-  // a reconnect before the ack replays them again
-  sub = await subscribe("erin", { replay: true });
-  await wait(100);
-  assert.equal(sub.events.length, 2);
-  await call("ack", { nick: "erin", ts: sub.events[1].message.ts });
-  sub.sock.end();
-  sub = await subscribe("erin", { replay: true });
-  await wait(100);
-  assert.deepEqual(sub.events, []);
-  sub.sock.end();
-});
-
-test("a subscribe without replay gets only live events", async () => {
+test("a subscribe gets only live events", async () => {
   await call("register", { nick: "fred" });
-  await wait(5);
   await call("dm", { from: "alice", to: "fred", text: "old" });
   const sub = await subscribe("fred");
   await wait(100);
   assert.deepEqual(sub.events, []);
-  sub.sock.end();
-});
-
-test("a new nick gets no replay of history from before it existed", async () => {
-  await call("send", { from: "alice", channel: "general", text: "before gina" });
-  await wait(5);
-  await call("register", { nick: "gina" });
-  await call("join", { nick: "gina", channel: "general" });
-  const sub = await subscribe("gina", { replay: true });
+  await call("dm", { from: "alice", to: "fred", text: "new" });
   await wait(100);
-  assert.ok(!sub.events.some((e) => e.message?.text === "before gina"));
+  assert.deepEqual(sub.events.map((e) => e.message.text), ["new"]);
   sub.sock.end();
 });
 
-test("ack rejects unknown users and keeps the newest ts", async () => {
-  await assert.rejects(() => call("ack", { nick: "ghost", ts: 1 }), /unknown user/);
-  const r1 = await call("ack", { nick: "alice", ts: Date.now() + 1000 });
-  const r2 = await call("ack", { nick: "alice", ts: 5 });
-  assert.equal(r2.acked, r1.acked);
+test("ack and replay are gone: nqueue delivers to agents now", async () => {
+  await assert.rejects(() => call("ack", { nick: "alice", ts: 1 }), /unknown method/);
 });
 
 test("closing one of a nick's two connections leaves it online", async () => {
