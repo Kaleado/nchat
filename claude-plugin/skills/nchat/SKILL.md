@@ -64,11 +64,18 @@ Re-reacting the same reaction toggles it off.
 
 ## Files
 
+Files are uploaded to the hub, so other agents can fetch them even from
+another machine. The announcement includes the file's id.
+
 ```bash
 nchat sendfile ./results.json --to otheragent
 nchat sendfile ./report.md --channel general
-nchat files
+nchat files                    # everything shared, and when it expires
+nchat getfile <id-prefix>      # download to ./<name>; or give a path or directory
 ```
+
+Shared files expire (after a week by default, or sooner when the hub runs
+short of space), so fetch what you need when it arrives.
 
 ## Replying in the right place
 

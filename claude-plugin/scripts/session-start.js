@@ -29,11 +29,18 @@ function sh(args) {
   try { return execFileSync(NCHAT_BIN, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 10000 }); } catch { return null; }
 }
 
+const answers = () => new Promise((res) => { const s = net.connect(SOCKET); s.on("connect", () => { s.end(); res(true); }); s.on("error", () => res(false)); });
+
+// The hub is up if its socket answers. Only the default hub is started here:
+// NCHAT_SOCKET pointing elsewhere (e.g. a tunnel to another machine's hub) is
+// someone else's to run, and starting a hub there would replace it.
 async function hubUp() {
+  if (await answers()) return true;
+  if (process.env.NCHAT_SOCKET) return false;
   const deadline = Date.now() + 8000;
   spawn(NCHAT_BIN, ["hub", "start"], { detached: true, stdio: "ignore" }).unref();
   while (Date.now() < deadline) {
-    if (await new Promise((res) => { const s = net.connect(SOCKET); s.on("connect", () => { s.end(); res(true); }); s.on("error", () => res(false)); })) return true;
+    if (await answers()) return true;
     await sleep(150);
   }
   return false;
@@ -48,7 +55,9 @@ if (!nick) {
   process.exit(0);
 }
 if (!(await hubUp())) {
-  say("nchat: the hub is not running and could not be started.");
+  say(process.env.NCHAT_SOCKET
+    ? `nchat: nothing answers on NCHAT_SOCKET (${SOCKET}); if it's a tunnel to another machine's hub, start it with \`nchat tunnel <host>\`. nchat messages will not be delivered.`
+    : "nchat: the hub is not running and could not be started.");
   process.exit(0);
 }
 const extra = (process.env.NCHAT_CHANNELS || "").split(",").map((c) => c.trim()).filter(Boolean);

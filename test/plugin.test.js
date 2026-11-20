@@ -57,6 +57,14 @@ test("SessionStart without an nqueue ID says nqueue is needed", () => {
   assert.ok(!calls().some((c) => c.startsWith("register")));
 });
 
+test("SessionStart doesn't start a hub where NCHAT_SOCKET points to nothing", () => {
+  fs.writeFileSync(path.join(IDS, "cc-s3"), "quiet-lynx-33\n");
+  fs.rmSync(CALLS, { force: true });
+  const context = hook("session-start.js", "s3", { NCHAT_SOCKET: path.join(HOME, "tunnels", "gone.sock") });
+  assert.match(context, /nchat tunnel/);
+  assert.deepEqual(calls(), []);
+});
+
 test("SessionEnd sets the nick offline", () => {
   fs.writeFileSync(path.join(IDS, "cc-s2"), "brave-owl-22\n");
   fs.rmSync(CALLS, { force: true });

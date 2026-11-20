@@ -109,6 +109,57 @@ test("sendfile and files", async () => {
   assert.match(r.out, /payload\.txt/);
 });
 
+test("getfile downloads a shared file, and won't overwrite without --force", async () => {
+  const f = path.join(TMP, "report.txt");
+  fs.writeFileSync(f, "the report");
+  let r = await run(["sendfile", f, "--channel", "general", "--as", "cli_alice"]);
+  assert.equal(r.code, 0, r.err);
+  const fid = r.out.match(/\[(\w+)\]/)[1];
+  r = await run(["files"]);
+  assert.match(r.out, new RegExp(`\\[${fid}\\] report\\.txt \\(10B\\) from cli_alice -> #general  expires `));
+  const dir = fs.mkdtempSync(path.join(TMP, "dl-"));
+  r = await run(["getfile", fid.slice(0, 6), dir]);
+  assert.equal(r.code, 0, r.err);
+  assert.equal(fs.readFileSync(path.join(dir, "report.txt"), "utf8"), "the report");
+  r = await run(["getfile", fid, dir]);
+  assert.notEqual(r.code, 0);
+  assert.match(r.err, /already exists/);
+  fs.writeFileSync(path.join(dir, "report.txt"), "old");
+  r = await run(["getfile", fid, dir, "--force"]);
+  assert.equal(r.code, 0, r.err);
+  assert.equal(fs.readFileSync(path.join(dir, "report.txt"), "utf8"), "the report");
+  r = await run(["history", "general"]);
+  assert.match(r.out, /cli_alice: shared file report\.txt \(10B\)/);
+});
+
+test("tunnel asks the other machine for its socket, then forwards to it", async () => {
+  const log = path.join(TMP, "ssh.log");
+  const ssh = path.join(TMP, "fake-ssh");
+  fs.writeFileSync(ssh, `#!/bin/sh\necho "$*" >> ${log}\ncase "$*" in *printf*) printf /home/me/.nchat/hub.sock ;; esac\n`, { mode: 0o755 });
+  const home = fs.mkdtempSync(path.join(TMP, "home-"));
+  let r = await run(["tunnel", "me@box", "--", "-p", "2222"], { NCHAT_SSH: ssh, NCHAT_HOME: path.join(home, ".nchat") });
+  assert.equal(r.code, 0, r.err);
+  const local = path.join(home, ".nchat", "tunnels", "me@box.sock");
+  assert.match(r.err, new RegExp(`export NCHAT_SOCKET=${local.replace(/[.]/g, "\\.")}`));
+  const calls = fs.readFileSync(log, "utf8").trim().split("\n");
+  assert.equal(calls.length, 2);
+  assert.match(calls[0], /^-p 2222 -- me@box sh -c /);
+  assert.equal(calls[1], `-N -o StreamLocalBindUnlink=yes -o ExitOnForwardFailure=yes -L ${local}:/home/me/.nchat/hub.sock -p 2222 -- me@box`);
+  assert.equal(fs.statSync(path.dirname(local)).mode & 0o777, 0o700);
+});
+
+test("hub start won't start a hub on a tunnel's socket or over one that answers", async () => {
+  const home = fs.mkdtempSync(path.join(TMP, "home-"));
+  const tunnelSock = path.join(home, ".nchat", "tunnels", "box.sock");
+  let r = await run(["hub", "start"], { NCHAT_HOME: path.join(home, ".nchat"), NCHAT_SOCKET: tunnelSock });
+  assert.notEqual(r.code, 0);
+  assert.match(r.err, /tunnel's socket/);
+  // the hub these tests use answers on NCHAT_SOCKET, without a pid file of ours
+  r = await run(["hub", "start"], { NCHAT_HOME: path.join(home, ".nchat") });
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.out, /already/);
+});
+
 test("topic get and set", async () => {
   let r = await run(["topic", "general", "The Lobby", "--as", "cli_alice"]);
   assert.equal(r.code, 0, r.err);

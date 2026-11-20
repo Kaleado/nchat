@@ -59,8 +59,11 @@ nchat history <channel> [--n N]        channel history
 nchat dmhistory <nick> [--n N]         DM history
 nchat status [online|away|busy] [text] set your status/rich presence
 nchat whoami [nick]                    user info
-nchat sendfile <path> --channel c | --to nick   share a file
-nchat files                            list shared files
+nchat sendfile <path> --channel c | --to nick   upload a file to the hub and share it
+nchat getfile <id-prefix> [dest] [--force]      download a shared file (default ./<name>)
+nchat files                            list shared files and when they expire
+nchat tunnel <host> [--socket p] [--remote-socket p] [-- ssh options]
+                                       reach another machine's hub over SSH
 nchat listen [--as nick]               print live events; reconnects
 nchat help                             usage
 ```
@@ -123,6 +126,65 @@ ln -s "$(pwd)/skills/nchat" ~/.pi/agent/skills/nchat
 
 ## Data & files
 
-State lives in `~/.nchat/data/{users.json,state.json}`. Files are shared by
-reference to a local path (same machine). Env overrides: `NCHAT_SOCKET`,
-`NCHAT_DATA`, `NCHAT_NICK`.
+State lives in `~/.nchat/data/{users.json,state.json}`. Env overrides:
+`NCHAT_SOCKET`, `NCHAT_DATA`, `NCHAT_HOME` (default `~/.nchat`: the human's
+`nick` file, the hub's `config.json`, tunnels), `NCHAT_CONFIG`, `NCHAT_NICK`.
+
+### Shared files
+
+`nchat sendfile` streams the file to the hub, which keeps it in
+`~/.nchat/data/files/` and adds the share to the channel or DM history;
+`nchat getfile` streams it back, so files work wherever the hub can be reached
+(e.g. through a tunnel). Transfers go straight to disk, so large files are
+fine. Older clients' shares, which only recorded a local path, are still
+listed.
+
+Stored files don't accumulate: each expires after a time to live, and when
+storing a new file would go over a total size, the oldest files expire to
+make room. Set these in `~/.nchat/config.json` on the hub machine (changes
+apply without a restart):
+
+```json
+{
+  "files": {
+    "maxFileSize": "4GiB",
+    "ttl": "7d",
+    "maxTotalSize": "20GiB"
+  }
+}
+```
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `maxFileSize` | `4GiB` | Largest file accepted; refused before any bytes are sent |
+| `ttl` | `7d` | How long a file is kept (`s`, `m`, `h`, `d`, `w`) |
+| `maxTotalSize` | `20GiB` | Total kept; the oldest files expire to make room |
+
+Sizes take `K`/`M`/`G`/`T` (binary, 1024-based, with or without `B` or `iB`)
+or a plain number of bytes. Any setting can be `"off"`; with both `ttl` and
+`maxTotalSize` off, files are kept until deleted by hand. Expired files stay
+listed by `nchat files` with the reason they went.
+
+## Other machines
+
+The hub only listens on its unix socket. To use another machine's hub, tunnel
+to its socket over SSH, alongside nqueue's (which delivers the messages):
+
+```bash
+nqueue tunnel me@hub &
+nchat tunnel me@hub &
+export NQUEUE_VALKEY=valkey+unix://$HOME/.nqueue/tunnels/me@hub.sock
+export NCHAT_SOCKET=$HOME/.nchat/tunnels/me@hub.sock
+```
+
+`nchat tunnel` asks the other machine where its socket is (`$NCHAT_SOCKET`
+there, else `~/.nchat/hub.sock`; `--remote-socket` skips asking), forwards
+`~/.nchat/tunnels/<host>.sock` to it until stopped, and prints the
+`NCHAT_SOCKET` to use. History, channels, DMs, files and the TUI then all come
+from that hub. SSH options come from `~/.ssh/config` or after `--`;
+`NCHAT_SSH` picks another ssh.
+
+A hub never starts on top of a socket that answers, or on a tunnel's socket,
+so a session can't replace a tunnel (or another hub) with an empty local hub.
+The Claude Code plugin only starts the hub itself when `NCHAT_SOCKET` is
+unset.

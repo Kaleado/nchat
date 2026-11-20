@@ -1,11 +1,9 @@
 #!/usr/bin/env node
 // nchat CLI — the agent interface to the hub.
-import { call } from "../lib/common.js";
+import { call, upload, download, NICK_FILE, TUNNELS_DIR, SOCKET_PATH, socketAlive } from "../lib/common.js";
+import { formatSize } from "../lib/files.js";
 import fs from "node:fs";
-
-const NCHAT_DIR = (process.env.NCHAT_SOCKET || (process.env.HOME || "") + "/.nchat/hub.sock")
-  .replace(/[^/]*$/, "");
-const NICK_FILE = NCHAT_DIR + "nick";
+import path from "node:path";
 
 // Identity: --as, else $NQUEUE_ID (an agent session's nqueue agent ID, which
 // is its nick: messages to it are delivered to the session through nqueue),
@@ -55,7 +53,12 @@ Usage:
   nchat dmhistory <nick> [--n N]     Read DM history with nick
   nchat status [online|away|busy] [text]  Set your status
   nchat whoami [nick]                Show user info
-  nchat sendfile <path> [--channel c | --to nick]  Share a file
+  nchat sendfile <path> [--channel c | --to nick]  Upload a file to the hub and share it
+  nchat getfile <id-prefix> [dest] [--force]       Download a shared file (default: ./<name>)
+  nchat files                        List shared files and when they expire
+  nchat tunnel <host> [--socket p] [--remote-socket p] [-- ssh options]
+                                     Reach another machine's hub over SSH; prints
+                                     the NCHAT_SOCKET to use
   nchat files                        List shared files
   nchat listen [--as nick]           Print live events (blocks)
   nchat help                         This help
@@ -74,10 +77,14 @@ async function hubCommand(sub) {
   const start = async () => {
     const existing = readHubPid();
     if (existing) { console.log(`hub already running (pid ${existing})`); return; }
+    // a hub we have no pid file for, or a tunnel to another machine's hub
+    if (await socketAlive(SOCKET_PATH)) { console.log(`hub already answering on ${SOCKET_PATH}`); return; }
+    if (path.resolve(SOCKET_PATH).startsWith(path.resolve(TUNNELS_DIR) + path.sep)) {
+      throw new Error(`nothing answers on ${SOCKET_PATH}, which is a tunnel's socket: start the tunnel (nchat tunnel <host>), not a hub`);
+    }
     const child = spawn(process.execPath, [hubJs], { detached: true, stdio: "ignore" });
     child.unref();
     // wait for the socket to come up
-    const { SOCKET_PATH } = await import("../lib/common.js");
     const net = await import("node:net");
     const deadline = Date.now() + 4000;
     while (Date.now() < deadline) {
@@ -122,6 +129,10 @@ function parseArgs(argv) {
     else if (a === "--to") opts.to = argv[++i];
     else if (a === "--channel") opts.channel = argv[++i];
     else if (a === "--n") opts.n = parseInt(argv[++i], 10);
+    else if (a === "--force") opts.force = true;
+    else if (a === "--socket") opts.socket = argv[++i];
+    else if (a === "--remote-socket") opts.remoteSocket = argv[++i];
+    else if (a === "--") { opts.rest = argv.slice(i + 1); break; }
     else opts._.push(a);
   }
   return opts;
@@ -251,15 +262,41 @@ async function main() {
     case "sendfile": {
       if (!me) throw new Error("specify --as <nick> or NCHAT_NICK");
       const p = opts._[0];
-      const stat = fs.statSync(p);
-      const r = await call("sendFile", { from: me, channel: opts.channel, to: opts.to, name: p, size: stat.size, path: p });
-      console.log(`file shared [${r.fileId}] -> ${opts.to ? opts.to : "#" + opts.channel}`);
+      if (!p) throw new Error("usage: nchat sendfile <path> [--channel c | --to nick]");
+      if (!fs.statSync(p).isFile()) throw new Error(`${p} is not a file`);
+      const r = await upload({ from: me, channel: opts.to ? undefined : opts.channel || "general", to: opts.to, name: path.basename(p) }, p);
+      const exp = r.file.expiresAt ? `; expires ${new Date(r.file.expiresAt).toISOString().replace(/\.\d+Z$/, "Z")}` : "";
+      console.log(`file shared [${r.fileId}] -> ${opts.to ? opts.to : "#" + (opts.channel || "general")} (${formatSize(r.file.size)}${exp})`);
+      return;
+    }
+    case "getfile": {
+      const prefix = opts._[0];
+      if (!prefix) throw new Error("usage: nchat getfile <id-prefix> [dest] [--force]");
+      const { files } = await call("files", {});
+      const matches = files.filter((f) => f.id.startsWith(prefix));
+      if (matches.length === 0) throw new Error(`no file with id prefix "${prefix}"`);
+      if (matches.length > 1) throw new Error(`id prefix "${prefix}" is ambiguous (${matches.length} matches)`);
+      const f = matches[0];
+      let dest = opts._[1] || f.name;
+      try { if (fs.statSync(dest).isDirectory()) dest = path.join(dest, f.name); } catch {}
+      if (fs.existsSync(dest) && !opts.force) throw new Error(`${dest} already exists (use --force to replace it)`);
+      await download(f.id, dest);
+      console.log(`saved ${f.name} (${formatSize(f.size)}) to ${dest}`);
       return;
     }
     case "files": {
       const { files } = await call("files", {});
-      for (const f of files) console.log(`[${f.id}] ${f.name} (${f.size}b) from ${f.from} -> ${f.to ? "@" + f.to : "#" + f.channel}`);
+      for (const f of files) {
+        const where = f.to ? "@" + f.to : "#" + f.channel;
+        const state = f.stored
+          ? f.expiresAt ? `expires ${new Date(f.expiresAt).toISOString().replace(/\.\d+Z$/, "Z")}` : "kept"
+          : f.expired ? `expired (${f.expiredBy === "space" ? "space needed" : "time to live"})` : `path only: ${f.path}`;
+        console.log(`[${f.id}] ${f.name} (${formatSize(f.size)}) from ${f.from} -> ${where}  ${state}`);
+      }
       return;
+    }
+    case "tunnel": {
+      return tunnel(opts);
     }
     case "listen": {
       if (!me) throw new Error("specify --as <nick> or NCHAT_NICK");
@@ -269,6 +306,38 @@ async function main() {
     default:
       throw new Error(`unknown command: ${cmd}\n${USAGE}`);
   }
+}
+
+// Forward a local socket to another machine's hub over SSH until stopped.
+// Asks the other machine where its socket is unless given --remote-socket.
+async function tunnel(opts) {
+  const { spawn, spawnSync } = await import("node:child_process");
+  const dest = opts._[0];
+  if (!dest || dest.startsWith("-")) throw new Error("usage: nchat tunnel <host> [--socket p] [--remote-socket p] [-- ssh options]");
+  const ssh = process.env.NCHAT_SSH || "ssh";
+  const sshArgs = opts.rest || [];
+  const local = opts.socket || path.join(TUNNELS_DIR, `${dest.replace(/[^A-Za-z0-9.@_-]/g, "_")}.sock`);
+  fs.mkdirSync(path.dirname(local), { recursive: true, mode: 0o700 });
+  let remote = opts.remoteSocket;
+  if (!remote) {
+    // single-quoted, so the remote login shell (sh, bash, fish) hands it to sh as is
+    const script = `sh -c 'printf "%s" "\${NCHAT_SOCKET:-\$HOME/.nchat/hub.sock}"'`;
+    const r = spawnSync(ssh, [...sshArgs, "--", dest, script], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+    if (r.error) throw new Error(`running ${ssh}: ${r.error.message}`);
+    if (r.status !== 0) throw new Error(`asking ${dest} for its hub socket: ${(r.stderr || "").trim()}`);
+    remote = r.stdout.trim();
+    if (!remote.startsWith("/")) throw new Error(`${dest} gave an unusable socket path "${remote}"; pass --remote-socket`);
+  }
+  console.error(`nchat: forwarding ${local} to ${dest}:${remote}`);
+  console.error(`nchat: to use it: export NCHAT_SOCKET=${local}`);
+  const child = spawn(ssh, ["-N", "-o", "StreamLocalBindUnlink=yes", "-o", "ExitOnForwardFailure=yes",
+    "-L", `${local}:${remote}`, ...sshArgs, "--", dest], { stdio: "inherit" });
+  for (const sig of ["SIGINT", "SIGTERM"]) process.on(sig, () => child.kill(sig));
+  const code = await new Promise((resolve) => {
+    child.on("error", (e) => { console.error(`error: running ${ssh}: ${e.message}`); resolve(2); });
+    child.on("exit", (c, sig) => resolve(c ?? (sig ? 0 : 1)));
+  });
+  process.exitCode = code;
 }
 
 // Print the nick's live events as JSON lines. Reconnects when the hub goes
