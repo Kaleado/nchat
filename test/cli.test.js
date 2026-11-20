@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "nchat-cli-"));
 process.env.NCHAT_SOCKET = path.join(TMP, "hub.sock");
+process.env.NCHAT_HOME = path.join(TMP, "home"); // not the real ~/.nchat (its nick file)
 process.env.NCHAT_DATA = path.join(TMP, "data");
 process.env.NCHAT_NQUEUE = "0"; // delivery through nqueue is tested in nqueue.test.js
 // the tests' own identities only (not the session running them)
